@@ -2,11 +2,11 @@
 Evaluation of multiple classifiers over multiple datasets with:
 - Omnibus Friedman test (Iman-Davenport) on ranks per dataset
 - Post-hoc:
-  * vs control: Dunn/Bonferroni in the CD-plot; table of p-values corrected with Holm
-  * all-vs-all: Nemenyi in the CD-plot; possibly MCM with Wilcoxon + Holm
+ ->vs control: Dunn/Bonferroni in the CD-plot; table of p-values corrected with Holm
+ ->all-vs-all: Nemenyi in the CD-plot; possibly MCM with Wilcoxon + Holm
 
 REFERENCES:
-- Demšar, J. (2006). Statistical comparisons of classifiers over multiple data sets. JMLR.
+- Demsar, J. (2006). Statistical comparisons of classifiers over multiple data sets. JMLR.
 - Iman, R. L., & Davenport, J. M. (1980). Approximations of the critical region of the Friedman statistic. Communications in Statistics.
 - Dunn, O. J. (1961). Multiple comparisons among means. Journal of the American Statistical Association.
 - Holm, S. (1979). A simple sequentially rejective multiple test procedure. Scandinavian Journal of Statistics.
