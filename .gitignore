@@ -1,0 +1,13 @@
+*.log
+__pycache__/
+*.pyc
+.venv/
+.history/
+
+.DS_Store
+COMPETITORS/__pycache__/
+COMPETITORS/*.pyc
+COMPETITORS/.DS_Store
+COMPETITORS/models/__pycache__/
+COMPETITORS/models/*.pyc
+COMPETITORS/models/.DS_Store
