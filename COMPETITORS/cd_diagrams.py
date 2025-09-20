@@ -407,13 +407,13 @@ def make_mcm_plot(
 if __name__ == "__main__":
     FOLDER = "RESULTS"
     with_scorecard = False
-    OUTDIR = "cd_diagrams"
-    if with_scorecard:
-        OUTDIR = "con_scorecard"
+    OUTDIR = "csv_files_img"
 
     BASELINE = None
+    suffix = ""
     if with_scorecard:
         BASELINE = "RULECARD"
+        suffix = "_rulecard"
 
     METRICS = [
         ("AUC (%)", False),
@@ -421,8 +421,13 @@ if __name__ == "__main__":
         ("Time Training (s)", True),
     ]
 
-    df_all = load_model_csvs(FOLDER, required_columns=tuple(m for m, _ in METRICS), with_scorecard=with_scorecard)
+    df_all = load_model_csvs(
+        FOLDER,
+        required_columns=tuple(m for m, _ in METRICS),
+        with_scorecard=with_scorecard,
+    )
 
+    # CD-diagrams
     for metric, lower_better in METRICS:
         make_cd_plot(
             df_all,
@@ -436,9 +441,10 @@ if __name__ == "__main__":
             control=BASELINE,
             export_posthoc_table=True,
             outdir=OUTDIR,
+            out_prefix=f"{metric.replace(' ', '_').replace('%','perc')}{suffix}",
         )
 
-    # MCM plots (Wilcoxon + Holm)
+    # MCM plots
     for metric, lower_better in METRICS:
         make_mcm_plot(
             df_all,
@@ -447,4 +453,5 @@ if __name__ == "__main__":
             save_formats=("png",),
             alpha=0.05,
             outdir=OUTDIR,
+            out_prefix=f"{metric.replace(' ', '_').replace('%','perc')}{suffix}",
         )
