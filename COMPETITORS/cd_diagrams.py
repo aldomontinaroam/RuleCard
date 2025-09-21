@@ -86,7 +86,7 @@ def load_model_csvs(
     for fn in os.listdir(folder):
         if not fn.lower().endswith(".csv"):
             continue
-        if not with_scorecard and "scorecard" in fn.lower():
+        if not with_scorecard and "rulecard" in fn.lower():
             continue
         path = os.path.join(folder, fn)
         model = _infer_model_name(path)
@@ -179,7 +179,7 @@ def friedman_report(pivot: pd.DataFrame) -> dict:
         return {"test": "wilcoxon", "p": float(p), "k": k, "N": N}
 
     chi2, p_chi2 = friedmanchisquare(*[pivot[c].values for c in cols])
-    Ff = ((N - 1) * chi2) / (N * (k - 1) - chi2)  # Iman–Davenport
+    Ff = ((N - 1) * chi2) / (N * (k - 1) - chi2)  # Iman-Davenport
     p_F = f.sf(Ff, k - 1, (k - 1) * (N - 1))
     print(
         f"[Friedman] chi2={chi2:.3f}, p={p_chi2:.4g} | "
@@ -335,10 +335,10 @@ def make_cd_plot(
     title_suffix = ""
     if omnibus["test"] == "friedman":
         p_id = omnibus["p_ID"]
-        title_suffix = f" — Friedman/Iman–Davenport p={p_id:.3g}"
+        title_suffix = f" — Friedman/Iman-Davenport p={p_id:.3g}"
     elif omnibus["test"] == "wilcoxon":
         title_suffix = f" — Wilcoxon p={omnibus['p']:.3g}"
-    ax.set_title(f"CD Diagram – {metric}{title_suffix}", fontsize=14)
+    ax.set_title(f"CD Diagram - {metric}{title_suffix}", fontsize=14)
 
     png_path = os.path.join(outdir, f"{out_prefix}.png")
     fig.savefig(png_path, bbox_inches="tight", dpi=png_dpi)
@@ -393,7 +393,7 @@ def make_mcm_plot(
         dataset_column="dataset_name",
         precision=4,
         colormap="coolwarm",
-        fig_size=(20, 8),
+        fig_size=(22, 8),
         font_size=16,
         include_legend=True,
         show_symetry=True,
@@ -441,7 +441,7 @@ if __name__ == "__main__":
             control=BASELINE,
             export_posthoc_table=True,
             outdir=OUTDIR,
-            out_prefix=f"{metric.replace(' ', '_').replace('%','perc')}{suffix}",
+            out_prefix=f"CD_{metric.replace(' ', '_').replace('%','perc')}{suffix}",
         )
 
     # MCM plots
@@ -453,5 +453,5 @@ if __name__ == "__main__":
             save_formats=("png",),
             alpha=0.05,
             outdir=OUTDIR,
-            out_prefix=f"{metric.replace(' ', '_').replace('%','perc')}{suffix}",
+            out_prefix=f"MCM_{metric.replace(' ', '_').replace('%','perc')}{suffix}",
         )
