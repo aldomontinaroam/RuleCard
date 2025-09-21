@@ -1,0 +1,10 @@
+method,rank_variance,score_std,score_range,mean_SCORE,needs_standardization,SCORE_TOTAL
+select_kbest_chi2,0.39,11.47,39.02,22.76,1,1.0
+select_kbest,0.81,16.04,57.44,16.43,1,0.677647760400971
+logistic_regression_l2,0.75,18.31,59.42,15.43,1,0.6337940961590821
+logistic_regression_l1,5.33,11.85,37.52,9.62,1,0.3419855534575484
+random_forest,0.75,0.15,0.49,0.77,0,0.1680460844127336
+lightgbm,0.7,0.96,3.61,1.77,0,0.04946252449118767
+catboost,0.75,0.81,2.93,1.51,0,0.04112628019139968
+xgboost,0.99,0.49,1.78,1.12,0,0.03895049900628954
+select_kbest_mi,2.06,1.65,5.42,1.43,0,0.0

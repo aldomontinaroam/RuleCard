@@ -1,0 +1,13 @@
+dataset,wilcoxon_combined_p,significant_combined
+adult,0.0033627748489379883,True
+breast_cancer,4.4018030166625977e-05,True
+compas,1.0,False
+fico,2.9802322387695312e-08,True
+mushroom,1.0,False
+spambase,2.9802322387695312e-08,True
+titanic,2.6226043701171875e-06,True
+telco,2.9802322387695312e-08,True
+heart,1.2814998626708984e-06,True
+loan,1.0,False
+magic_gamma,2.9802322387695312e-08,True
+german,2.9802322387695312e-08,True
