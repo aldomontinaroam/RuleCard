@@ -33,13 +33,6 @@ if not logger.hasHandlers():
 
 
 class Model2D(ClassifierMixin, BaseEstimator):
-    """
-    New functions:
-    - Selection always by gain (no fixed priority to 1D).
-    - Pairwise features are always refitted on the current residual before comparison.
-    - Candidate cache updated every cache_refresh_every iterations.
-    - FAST re-executed every fast_refresh_every iterations (merging new pairs).
-    """
 
     def __init__(
         self,
@@ -183,7 +176,7 @@ class Model2D(ClassifierMixin, BaseEstimator):
             return roc_auc_score(y, p)
         elif metric == "logloss":
             p = np.clip(p, eps, 1 - eps)
-            return -log_loss(y, p)  # segno negativo massimizziamo
+            return -log_loss(y, p)
         else:
             preds = (p >= thr).astype(int)
             if metric == "accuracy": return accuracy_score(y, preds)
@@ -236,11 +229,7 @@ class Model2D(ClassifierMixin, BaseEstimator):
         pair_meta: Optional[List[Tuple[int, int]]] = None,
         sample_weight=None
     ):
-        """
-        Addestra (o ri-addestra) tutti i candidati (1D + 2D) sul residuo fornito e,
-        se possibile, cacha le predizioni su train.
-        """
-        # --- 0) Garantisci array NumPy contiguo e dtype prevedibile (senza pandas) ---
+    
         if hasattr(X_tr, "to_numpy"):
             X_tr = X_tr.to_numpy(copy=False)
         X_tr = np.ascontiguousarray(X_tr)
@@ -255,22 +244,17 @@ class Model2D(ClassifierMixin, BaseEstimator):
         if self.max_pair_candidates is not None and len(self._pair_meta) > self.max_pair_candidates:
             self._pair_meta = self._pair_meta[:self.max_pair_candidates]
 
-        # Utility RAM
         def bytes_cache(shape):
             return int(np.prod(shape)) * np.dtype(dtype).itemsize
 
-        # -------------------------------------------------
-        # 1) Univariate learners
-        # -------------------------------------------------
         self._uni_trees = []
         if self.group_mode in ("univariate", "mixed"):
-            # Maschera boolean per escludere feature già usate / bloccate
             mask_uni = np.ones(p, dtype=bool)
             if getattr(self, "used_features_1d_", None):
                 mask_uni[np.fromiter(self.used_features_1d_, dtype=np.intp)] = False
             if getattr(self, "block_univariate_if_in_pair", False) and getattr(self, "_features_used_in_pairs", None):
                 mask_uni[np.fromiter(self._features_used_in_pairs, dtype=np.intp)] = False
-            valid_uni = np.nonzero(mask_uni)[0]  # array di int
+            valid_uni = np.nonzero(mask_uni)[0]
 
             if self.precompute_univariate and valid_uni.size > 0:
                 results = Parallel(n_jobs=-1, prefer="threads")(
@@ -279,12 +263,10 @@ class Model2D(ClassifierMixin, BaseEstimator):
                     )
                     for i in valid_uni
                 )
-                trees, preds = zip(*results)  # ciascun preds[k] ha shape (n,)
+                trees, preds = zip(*results)
                 self._uni_trees = list(trees)
 
-                # Prealloca piena matrice p-colonne (come nel tuo codice) e riempi solo le valide
                 uni_pred = np.zeros((n, p), dtype=dtype)
-                # Stack una sola volta (n, n_valid) e assegna a colonne selezionate
                 pred_mat = np.stack(preds, axis=1).astype(dtype, copy=False)
                 uni_pred[:, valid_uni] = pred_mat
                 self._uni_pred_cache = uni_pred
@@ -293,18 +275,12 @@ class Model2D(ClassifierMixin, BaseEstimator):
             self._uni_index_map = {int(j): int(k) for k, j in enumerate(valid_uni)}
         else:
             self._uni_pred_cache = None
-
-        # -------------------------------------------------
-        # 2) Pairwise learners
-        # -------------------------------------------------
         q_total = len(self._pair_meta)
 
-        # Filtra solo le coppie effettivamente candidabili
         if q_total > 0:
             if getattr(self, "allow_pair_reuse", False):
                 valid_pairs = list(self._pair_meta)
             else:
-                # normalizza le tuple per confronti veloci
                 used = getattr(self, "_used_pair_tuples", set())
                 valid_pairs = [(i, j) for (i, j) in self._pair_meta
                             if (min(i, j), max(i, j)) not in used]
@@ -312,7 +288,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
         else:
             valid_pairs, q_valid = [], 0
 
-        # Stima memoria solo sui necessari
         need_uni = bytes_cache((n, p)) if self._uni_pred_cache is not None else 0
         need_pair = bytes_cache((n, q_valid)) if (self.precompute_pairs and q_valid > 0) else 0
 
@@ -338,14 +313,13 @@ class Model2D(ClassifierMixin, BaseEstimator):
                     for (i, j) in valid_pairs
                 )
                 trees, preds = zip(*results)
-                self._pair_trees_cache = list(trees)  # cache-aligned
+                self._pair_trees_cache = list(trees)
                 pred_mat = np.stack(preds, axis=1).astype(dtype, copy=False)
                 self._pair_pred_cache = pred_mat
             else:
                 self._pair_pred_cache = None
                 self._pair_trees_cache = None
 
-            # mappa cache-col -> indice in _pair_meta
             idx_map = { (min(i,j), max(i,j)) : k for k,(i,j) in enumerate(self._pair_meta) }
             self._pair_cache_meta_idx = np.array(
                 [ idx_map[(min(i,j), max(i,j))] for (i,j) in valid_pairs ],
@@ -389,9 +363,7 @@ class Model2D(ClassifierMixin, BaseEstimator):
             self.feature_names_in_ = np.arange(arr.shape[1])
             return arr, {j: j for j in range(arr.shape[1])}
 
-    # ---------- API ----------
     def fit(self, X: ArrayLike, y: ArrayLike, sample_weight: Optional[np.ndarray] = None):
-        # ---- logger level coerente con verbose ----
         _prev_level = logger.level
         try:
             if getattr(self, "verbose", 0) >= 2:
@@ -401,17 +373,15 @@ class Model2D(ClassifierMixin, BaseEstimator):
             else:
                 logger.setLevel(logging.WARNING)
 
-            # ---- feature names / importance preliminari ----
             self._capture_feature_names(X)
             if self.feature_importance_fn is not None:
                 out = self.feature_importance_fn(X, y)
                 self.feature_order = out[0] if isinstance(out, (tuple, list)) else out
 
             X_in, y_in = X, y
-            X_arr, colmap = self._as_array(X_in)  # mappatura nome->indice
+            X_arr, colmap = self._as_array(X_in)
             X, y = check_X_y(X, y, accept_sparse=False, dtype=np.float32)
 
-            # Se l'utente passa sample_weight, valida solo la shape ORA (prima di eventuali split)
             if sample_weight is not None:
                 sample_weight = np.asarray(sample_weight, dtype=np.float32).reshape(-1)
                 if sample_weight.shape[0] != y.shape[0]:
@@ -419,7 +389,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         f"sample_weight length mismatch: got {sample_weight.shape[0]} vs y={y.shape[0]}"
                     )
 
-            # ---- validazioni ----
             u = np.unique(y)
             if not np.array_equal(u, np.array([0.0, 1.0])):
                 raise ValueError("Questo classificatore supporta y binaria {0,1}.")
@@ -434,7 +403,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                     f"mode={self.group_mode}, selection={self.selection}"
                 )
 
-            # ---- reset stato interno ----
             self.stages_.clear()
             self.used_features_1d_.clear()
             self.used_pairs_.clear()
@@ -446,9 +414,8 @@ class Model2D(ClassifierMixin, BaseEstimator):
             self._pair_cache_meta_idx = None
             self._pair_trees_cache = None
 
-            # ---- split validation (se non fornita) ----
-            # Nota: se eseguiamo lo split qui, splittiamo ANCHE i pesi.
-            sw_tr = None  # verrà popolato se necessario
+            
+            sw_tr = None
             if (self.validation_X is None) or (self.validation_y is None):
                 if sample_weight is not None:
                     X, self.validation_X, y, self.validation_y, sw_tr, _sw_val = train_test_split(
@@ -464,21 +431,18 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         random_state=self.random_state,
                         stratify=y
                     )
-            # else: validation fornita dall'utente -> non tocchiamo X,y,sample_weight
-
-            # ---- early stopping: prepara tr/val ----
+            
             if self.early_stopping:
                 if self.validation_X is not None and self.validation_y is not None:
                     X_tr, y_tr = X, y
                     X_val = check_array(self.validation_X, dtype=np.float32)
                     y_val = np.asarray(self.validation_y, dtype=np.float32)
-                    # allinea i pesi al train corrente
+
                     if sample_weight is not None and sw_tr is not None:
                         sample_weight_tr = np.asarray(sw_tr, dtype=np.float32).reshape(-1)
                     else:
                         sample_weight_tr = None
                 else:
-                    # (caso raro, mantenuto per compatibilità)
                     X_tr, X_val, y_tr, y_val = train_test_split(
                         X, y,
                         test_size=self.validation_fraction,
@@ -486,12 +450,11 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         stratify=y
                     )
                     if sample_weight is not None:
-                        # se avevamo pesi, rifacciamo lo split in parallelo
                         sample_weight_tr, _sw_val2 = train_test_split(
                             sample_weight,
                             test_size=self.validation_fraction,
                             random_state=self.random_state,
-                            stratify=y  # stratify sullo stesso y di sopra
+                            stratify=y
                         )
                     else:
                         sample_weight_tr = None
@@ -503,31 +466,25 @@ class Model2D(ClassifierMixin, BaseEstimator):
                     np.asarray(sample_weight, dtype=np.float32).reshape(-1) if sample_weight is not None else None
                 )
 
-            # ---- auto-balance dei pesi (SOLO se l'utente non li ha forniti) ----
             if sample_weight_tr is None:
-                # class_weight="balanced" equivalente sui soli campioni di training
                 n_pos = float(np.sum(y_tr == 1))
                 n_neg = float(np.sum(y_tr == 0))
                 w_pos = (len(y_tr) / (2.0 * (n_pos + 1e-12)))
                 w_neg = (len(y_tr) / (2.0 * (n_neg + 1e-12)))
                 sample_weight_tr = np.where(y_tr == 1, w_pos, w_neg).astype(np.float32)
 
-            # Safety check: i pesi devono combaciare con y_tr
             if sample_weight_tr.shape[0] != y_tr.shape[0]:
                 raise ValueError(
                     f"internal error: sample_weight_tr length {sample_weight_tr.shape[0]} "
                     f"!= y_tr length {y_tr.shape[0]}"
                 )
 
-            # D'ora in avanti usa SEMPRE 'sample_weight = sample_weight_tr' per coerenza
             sample_weight = sample_weight_tr
 
-            # ---- inizializza margini ----
-            self._init_base_score(y_tr)  # definisce p0_, log_odds_p0_, ecc.
+            self._init_base_score(y_tr)
             F_tr = np.full(y_tr.shape[0], self.log_odds_p0_, dtype=np.float32)
             F_val = np.full(y_val.shape[0], self.log_odds_p0_, dtype=np.float32) if self.early_stopping else None
 
-            # ---- early stopping tracking ----
             best_score = None
             best_iter = 0
             prev_score = None
@@ -548,7 +505,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                 if self.verbose >= 1:
                     logger.info(f"[Iter 0] val_{self.early_stopping_metric}={s0:.6f}")
 
-            # ---- FAST iniziale ----
             if self.group_mode in ("pairwise", "mixed"):
                 residual0 = y_tr - expit(F_tr)
                 feat_names = [str(nm) for nm in self.feature_names_in_]
@@ -570,19 +526,16 @@ class Model2D(ClassifierMixin, BaseEstimator):
                 self._fast_pairs_ = []
                 self._pair_meta = []
 
-            # ---- Cache iniziale ----
             self._Xtr_cache = X_tr
             r0 = y_tr - self.p0_
             self._build_candidate_cache(X_tr, r0, pair_meta=self._pair_meta, sample_weight=sample_weight)
 
-            # ---- iterazioni massime ----
             if self.n_stages is not None:
                 T = int(self.n_stages)
             else:
                 q = len(self._pair_meta) if self.group_mode in ("pairwise", "mixed") else 0
                 T = int(p + q) if self.group_mode in ("pairwise", "mixed") else int(p)
 
-            # ========== Progress bar per verbose==1 ==========
             pbar = None
             if self.verbose == 1:
                 try:
@@ -591,17 +544,12 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         desc="Training",
                         leave=False,
                         dynamic_ncols=True,
-                        mininterval=0.3,   # throttling refresh
+                        mininterval=0.3,
                     )
                 except Exception:
-                    pbar = None  # se tqdm non disponibile, continua senza
+                    pbar = None
 
-
-            # =================================================
-            # FASE 1: univariate (STATIC)
-            # =================================================
             if self.selection == "static":
-                # costruisci ordine delle feature
                 if self.feature_importance_fn is not None:
                     out = self.feature_importance_fn(X_in, y_in)
 
@@ -669,17 +617,14 @@ class Model2D(ClassifierMixin, BaseEstimator):
                     self.stages_.append(_Stage(feats=(i,), tree=tree, kind="uni", score=float(stage_gain)))
                     self.used_features_1d_.append(i)
 
-                    # iterativo: DEBUG se verbose>=2
                     if self.verbose >= 2:
                         logger.debug(f"[Iter {t}/{T}] kind=uni, features=(f{i}), train_gain={stage_gain:.4f}")
 
-                    # progress bar se verbose==1
                     if pbar is not None:
                         if (t == 1) or (t % 25 == 0):
                             pbar.set_postfix_str(f"uni f{i} gain={stage_gain:.4f}")
                         pbar.update(1)
 
-                    # ---- ES (macro) ----
                     if self.early_stopping and X_val is not None:
                         pred_val = tree.predict(X_val[:, [i]])
                         F_val = F_val + self.lr * pred_val
@@ -722,15 +667,11 @@ class Model2D(ClassifierMixin, BaseEstimator):
                             break
                         prev_score = val_score
 
-            # =================================================
-            # FASE 2: greedy uni+pair
-            # =================================================
             start_t = len(self.stages_) + 1
             for t in range(start_t, T + 1):
                 base_loss_tr = self._loss_scalar(F_tr, y_tr, self.greedy_metric, self.epsilon, sample_weight=sample_weight)
                 residual = y_tr - expit(F_tr)
 
-                # --- Univariate cand. (cache -> block scoring + refit opzionale) ---
                 best_uni_i = None
                 best_uni_pred = None
                 best_uni_tree = None
@@ -756,22 +697,18 @@ class Model2D(ClassifierMixin, BaseEstimator):
                             best_uni_i = int(valid_idx[k_rel])
                             best_uni_loss = float(L[k_rel])
 
-                            # prendi l'albero dalla cache; rifitta SOLO se vuoi massima aderenza al residuo
                             k_tree = self._uni_index_map.get(best_uni_i, None)
                             if k_tree is not None and k_tree < len(self._uni_trees):
                                 cached_tree = self._uni_trees[k_tree]
                             else:
                                 cached_tree = None
 
-                            # opzionale ma consigliato: rifitta SOLO il vincitore sul residuo corrente
                             if cached_tree is None:
                                 t_uni = DecisionTreeRegressor(max_depth=self.max_depth, random_state=self.random_state)
                                 t_uni.fit(X_tr[:, [best_uni_i]], residual, sample_weight=sample_weight if sample_weight is not None else None)
                                 best_uni_tree = t_uni
                                 best_uni_pred = t_uni.predict(X_tr[:, [best_uni_i]])
                             else:
-                                # usa l'albero cached; se vuoi, rifittalo per coerenza 100%
-                                # (commenta le 3 righe seguenti se preferisci non rifittare)
                                 t_uni = DecisionTreeRegressor(max_depth=self.max_depth, random_state=self.random_state)
                                 t_uni.fit(X_tr[:, [best_uni_i]], residual, sample_weight=sample_weight if sample_weight is not None else None)
                                 cached_tree = t_uni
@@ -781,7 +718,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                                 best_uni_pred = self._uni_pred_cache[:, best_uni_i].astype(np.float32)
 
                     else:
-                        # Fallback senza cache: (meno efficiente) – rimane la tua versione per compatibilità
                         for i in range(p):
                             if i in self.used_features_1d_:
                                 continue
@@ -798,7 +734,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                                 best_uni_tree = tree_i
 
 
-                # --- Pairwise cand. (cache -> refit) ---
                 best_pair_idx = None
                 best_pair_feats = None
                 best_pair_loss_cached = np.inf
@@ -809,7 +744,7 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         if not self.allow_pair_reuse and len(self._used_pair_tuples) > 0:
                             mask = np.ones(valid_cols.size, dtype=bool)
                             for k, col in enumerate(valid_cols):
-                                meta_idx = int(self._pair_cache_meta_idx[col])     # mappa colonna cache -> indice in _pair_meta
+                                meta_idx = int(self._pair_cache_meta_idx[col])
                                 ii, jj = self._pair_meta[meta_idx]
                                 if (min(ii, jj), max(ii, jj)) in self._used_pair_tuples:
                                     mask[k] = False
@@ -827,9 +762,9 @@ class Model2D(ClassifierMixin, BaseEstimator):
                                 k_rel = int(np.argmin(L))
                                 if L[k_rel] < best_pair_loss_cached:
                                     best_pair_loss_cached = float(L[k_rel])
-                                    best_pair_idx = int(cols[k_rel])                  # <-- questo è l’INDICE DI COLONNA della cache
+                                    best_pair_idx = int(cols[k_rel])
                                     meta_idx = int(self._pair_cache_meta_idx[best_pair_idx])
-                                    best_pair_feats = self._pair_meta[meta_idx]       # <-- ecco la coppia giusta
+                                    best_pair_feats = self._pair_meta[meta_idx]
 
                     else:
                         for k_idx, (ii, jj) in enumerate(self._pair_meta):
@@ -837,7 +772,7 @@ class Model2D(ClassifierMixin, BaseEstimator):
                                 continue
                             pred = (
                                 DecisionTreeRegressor(max_depth=self.max_depth, random_state=self.random_state)
-                                .fit(X_tr[:, [ii, jj]], residual)  # <-- residuo CORRENTE, non y_tr - self.p0_
+                                .fit(X_tr[:, [ii, jj]], residual)
                                 .predict(X_tr[:, [ii, jj]])
                                 .astype(np.float32)
                             )
@@ -866,7 +801,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         self._pair_trees_cache[best_pair_idx] = tree_pair
 
 
-                # --- scelta candidato ---
                 candidates = []
                 if best_uni_i is not None:
                     candidates.append(("uni", best_uni_loss, (best_uni_i,), best_uni_tree, best_uni_pred))
@@ -879,9 +813,8 @@ class Model2D(ClassifierMixin, BaseEstimator):
 
                 candidates.sort(key=lambda x: x[1])
                 chosen_kind, loss_after, feats, tree, pred_tr = candidates[0]
-                # se i due migliori sono vicinissimi, rifitta e confronta di nuovo
                 if len(candidates) > 1 and (candidates[1][1] - candidates[0][1]) < 1e-4:
-                    pass  # già rifitti i vincitori; opzionale rifit anche del secondo se non lo era
+                    pass
 
                 # bookkeeping
                 if chosen_kind == "uni":
@@ -894,7 +827,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         self._features_used_in_pairs.update((ii, jj))
                     es_active = True
                 
-                # ---- Refresh periodici (ADATTIVO) ----
                 need_cache_refresh = (chosen_kind == "pair") or (t % self.cache_refresh_every == 0)
                 if need_cache_refresh:
                     if self.verbose >= 2:
@@ -926,16 +858,13 @@ class Model2D(ClassifierMixin, BaseEstimator):
                     if added > 0:
                         self._build_candidate_cache(X_tr, y_tr - expit(F_tr), pair_meta=self._pair_meta, sample_weight=sample_weight)
 
-                # update stato
                 F_tr = F_tr + self.lr * pred_tr
                 stage_gain = base_loss_tr - float(loss_after)
                 self.stages_.append(_Stage(feats=feats, tree=tree, kind=chosen_kind, score=stage_gain))
 
-                # iterativo: DEBUG se verbose>=2
                 if self.verbose >= 2:
                     logger.debug(f"[Iter {t}/{T}] kind={chosen_kind}, features={feats}, train_gain={stage_gain:.4f}")
 
-                # progress bar se verbose==1
                 if pbar is not None:
                     if (t == start_t) or (t % 25 == 0):
                         if chosen_kind == "uni":
@@ -944,7 +873,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                             pbar.set_postfix_str(f"pair ({feats[0]},{feats[1]}) gain={stage_gain:.4f}")
                     pbar.update(1)
 
-                # ---- ES (macro) ----
                 if self.early_stopping and X_val is not None:
                     pred_val = tree.predict(X_val[:, list(feats)]).astype(np.float32)
                     F_val = F_val + self.lr * pred_val
@@ -989,7 +917,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                         break
                     prev_score = val_score
 
-            # ---- truncation a best_iter (macro) ----
             if self.early_stopping and best_iter < len(self.stages_):
                 self.stages_ = self.stages_[:best_iter]
                 self.best_iteration_ = best_iter
@@ -997,7 +924,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                 if self.verbose >= 1:
                     logger.info(f"Final model truncated at iter {best_iter} (best_score={best_score:.6f})")
 
-            # ---- POST-PRUNING (macro) ----
             if self.group_mode == "mixed":
                 pair_scores = [st.score for st in self.stages_ if st.kind == "pair"]
                 if len(pair_scores) > 0:
@@ -1012,7 +938,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                     self.stages_ = kept
                     self.used_features_1d_ = sorted({i for st in self.stages_ if st.kind == "uni" for i in st.feats})
 
-            # ---- ricostruisci used_pairs_ ----
             self.used_pairs_.clear()
             for st in self.stages_:
                 if st.kind == "pair":
@@ -1025,7 +950,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
                             continue
                     self.used_pairs_.append(idx)
 
-            # chiudi eventuale pbar rimasta aperta
             if pbar is not None:
                 pbar.close()
 
@@ -1035,8 +959,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
         finally:
             logger.setLevel(_prev_level)
 
-
-    # ---------- inference ----------
     def decision_function(self, X: ArrayLike) -> np.ndarray:
         return self._raw_margin(X)
 
@@ -1048,8 +970,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
     def predict(self, X: ArrayLike) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= self.threshold).astype(int)
 
-
-    # ----- utilities -----
 
     def get_used_features(self) -> List:
         used = set()

@@ -5,6 +5,10 @@ from numpy.typing import ArrayLike
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple, Union, List, Sequence
 
+from utils import load_preprocess, get_feature_importance, get_available_datasets
+
+import ast
+
 from FAST import FAST
 
 from sklearn.base import BaseEstimator, ClassifierMixin
@@ -21,395 +25,13 @@ from sklearn.utils.validation import check_X_y, check_array
 from scipy.special import expit
 
 from joblib import Parallel, delayed
-from tqdm import tqdm as _tqdm
+from tqdm import tqdm
 import logging
 
 import numpy as np
+from itertools import product
 
-class ModelES(BaseEstimator, ClassifierMixin):
-    """
-    Additive boosting on 1D trees.
-    selection='static': follows a fixed feature order (like Model).
-    selection='greedy': chooses at each iteration the feature that minimizes the metric (like Model_v2).
-    
-    Early stopping (if early_stopping=True):
-      - maximizes the early_stopping_metric
-      - stops if: (A) no improvement > tol for patience iterations
-                 (B) worsening compared to the previous iteration for patience iterations
-    """
-
-    def __init__(
-        self,
-        max_depth: int = 2,
-        lr: float = 1.0,
-        selection: str = "greedy", # 'static' | 'greedy'
-        feature_order: Optional[Sequence] = None,
-        feature_importance_fn: Optional[Callable] = None,
-        greedy_metric: str = "logloss", # 'mse' | 'logloss'
-        threshold: float = 0.5,
-        random_state: Optional[int] = None,
-        epsilon: float = 1e-12,
-        
-        # Early stopping
-        early_stopping: bool = False,
-        early_stopping_metric: str = "auc", # 'auc' | 'logloss' | 'accuracy' | 'precision' | 'recall' | 'f1'
-        validation_fraction: float = 0.1,
-        patience: int = 10,
-        tol: float = 1e-4,
-        validation_X: Optional[ArrayLike] = None,
-        validation_y: Optional[ArrayLike] = None,
-        verbose: int = 0,
-    ):
-        self.max_depth = max_depth
-        self.lr = lr
-        self.selection = selection
-        self.feature_order = list(feature_order) if feature_order is not None else None
-        self.feature_importance_fn = feature_importance_fn
-        self.greedy_metric = greedy_metric
-        self.threshold = threshold
-        self.random_state = random_state
-        self.epsilon = epsilon
-
-        self.models_: List[Tuple[int, DecisionTreeRegressor]] = []
-        self.p0_: Optional[float] = None
-        self.log_odds_p0_: Optional[float] = None
-        self.used_features_: List[int] = []
-        self.n_estimators_: int = 0
-        self.classes_: np.ndarray = np.array([0, 1])
-        self.feature_names_in_: Optional[np.ndarray] = None
-        self.n_features_in_: Optional[int] = None
-
-
-        self.early_stopping = early_stopping
-        self.early_stopping_metric = early_stopping_metric
-        self.validation_fraction = validation_fraction
-        self.patience = int(patience)
-        self.tol = tol
-        self.validation_X = validation_X
-        self.validation_y = validation_y
-        self.verbose = verbose
-        self.validation_scores_: List[float] = []
-        self.best_iteration_: Optional[int] = None
-        self.best_score_: Optional[float] = None
-        self.stop_reason_: Optional[str] = None   # "no_improve", "worsening", None
-
-        if self.selection == 'static':
-            if self.feature_order is None and self.feature_importance_fn is None:
-                raise ValueError("Insert feature_order or feature_importance_fn")
-
-    def _rng(self):
-        return np.random.RandomState(self.random_state)
-
-    def _init_base_score(self, y: np.ndarray):
-        p0 = float(np.clip(np.mean(y), self.epsilon, 1 - self.epsilon))
-        self.p0_ = p0
-        self.log_odds_p0_ = float(np.log(p0 / (1 - p0)))
-
-    @staticmethod
-    def _score_from_margin(F: np.ndarray, y: np.ndarray, metric: str, thr: float, eps: float) -> float:
-        """Evaluates a classification metric given the margin F (logit)."""
-        p = expit(F)
-        if metric == "auc":
-            if len(np.unique(y)) < 2:
-                return 0.5
-            return roc_auc_score(y, p)
-        elif metric == "logloss":
-            p = np.clip(p, eps, 1 - eps)
-            return -log_loss(y, p)
-        else:
-            preds = (p >= thr).astype(int)
-            if metric == "accuracy":  return accuracy_score(y, preds)
-            if metric == "precision": return precision_score(y, preds, zero_division=0)
-            if metric == "recall":    return recall_score(y, preds, zero_division=0)
-            if metric == "f1":        return f1_score(y, preds, zero_division=0)
-            raise ValueError(f"early_stopping_metric not supported: {metric}")
-
-    @staticmethod
-    def _greedy_loss(y: np.ndarray, F_new: np.ndarray, kind: str, eps: float) -> float:
-        """Loss for greedy feature selection."""
-        p = expit(F_new)
-        if kind == "mse":
-            return float(np.mean((y - p) ** 2))
-        elif kind == "logloss":
-            p = np.clip(p, eps, 1 - eps)
-            return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))  # logloss
-        else:
-            raise ValueError(f"greedy_metric not supported: {kind}")
-
-    def _as_array(self, X):
-        import pandas as pd
-        if hasattr(X, "values") and not isinstance(X, np.ndarray):
-            self.feature_names_in_ = np.asarray(X.columns)
-            return X.values, {name: j for j, name in enumerate(self.feature_names_in_)}
-        elif isinstance(X, np.ndarray):
-            self.feature_names_in_ = np.arange(X.shape[1])
-            return X, {j: j for j in range(X.shape[1])}
-        else:
-            arr = np.asarray(X)
-            self.feature_names_in_ = np.arange(arr.shape[1])
-            return arr, {j: j for j in range(arr.shape[1])}
-
-    # ---------- API ----------
-    def fit(self, X: ArrayLike, y: ArrayLike):
-        if self.feature_importance_fn is not None and self.selection != "static":
-            warnings.warn("feature_importance_fn in input: setting selection='static'.")
-            self.selection = "static"
-
-        X_in = X
-        X_arr, colmap = self._as_array(X_in)
-
-        X, y = check_X_y(X_arr, y, accept_sparse=False, dtype=float)
-        if not np.array_equal(np.unique(y), [0, 1]):
-            raise ValueError("Questo classificatore supporta y binaria {0,1}.")
-
-        rng = self._rng()
-        n, p = X.shape
-        self.models_.clear()
-        self.used_features_.clear()
-        self.validation_scores_.clear()
-        self.n_estimators_ = 0
-        self.stop_reason_ = None
-
-        if self.early_stopping:
-            if self.validation_X is not None and self.validation_y is not None:
-                X_tr, y_tr = X, y
-                X_val = check_array(self.validation_X, dtype=float)
-                y_val = np.asarray(self.validation_y, dtype=float)
-            else:
-                X_tr, X_val, y_tr, y_val = train_test_split(
-                    X, y, test_size=self.validation_fraction,
-                    random_state=self.random_state, stratify=y
-                )
-        else:
-            X_tr, y_tr = X, y
-            X_val = y_val = None
-
-        self._init_base_score(y_tr)
-        F_tr = np.full(y_tr.shape[0], self.log_odds_p0_, dtype=float)
-        F_val = np.full(y_val.shape[0], self.log_odds_p0_, dtype=float) if self.early_stopping else None
-
-        best_score = None
-        best_iter = 0
-        prev_score = None
-        if self.early_stopping:
-            s0 = self._score_from_margin(F_val, y_val, self.early_stopping_metric, self.threshold, self.epsilon)
-            self.validation_scores_.append(s0)
-            best_score = s0
-            prev_score = s0
-            if self.verbose:
-                print(f"Iter 0: val_{self.early_stopping_metric}={s0:.6f}")
-
-        T = p
-
-        if self.selection == "static":
-            order_idx = None
-
-            if self.feature_importance_fn is not None:
-                out = self.feature_importance_fn(X_in, y)
-
-                def _map_to_idx(seq_like):
-                    idxs = []
-                    seen = set()
-                    for o in list(seq_like):
-                        if o in colmap:
-                            j = int(colmap[o])
-                        else:
-                            try:
-                                j = int(o)
-                            except Exception:
-                                continue
-                        if 0 <= j < p and j not in seen:
-                            seen.add(j)
-                            idxs.append(j)
-                    return idxs
-
-                order_candidate = None
-                importances = None
-
-                if isinstance(out, (tuple, list)) and len(out) >= 1:
-                    order_candidate = out[0]
-                    if len(out) >= 2:
-                        importances = out[1]
-                else:
-                    order_candidate = out
-
-                is_series_like = hasattr(order_candidate, "values") and hasattr(order_candidate, "index")
-                if isinstance(order_candidate, dict) or is_series_like:
-                    if isinstance(order_candidate, dict):
-                        items = sorted(order_candidate.items(), key=lambda kv: kv[1], reverse=True)
-                    else:
-                        try:
-                            items = list(order_candidate.sort_values(ascending=False).items())
-                        except Exception:
-                            items = [(k, v) for k, v in zip(list(order_candidate.index), list(order_candidate.values))]
-                            items.sort(key=lambda kv: kv[1], reverse=True)
-                    order_idx = _map_to_idx([k for k, _ in items])
-
-                if order_idx is None:
-                    try:
-                        seq = list(order_candidate)
-                        are_numbers = all(isinstance(v, (int, float, np.number)) for v in seq)
-                        if len(seq) == p and are_numbers:
-                            order_idx = list(np.argsort(np.asarray(seq))[::-1])
-                    except TypeError:
-                        pass
-
-                if order_idx is None:
-                    try:
-                        order_idx = _map_to_idx(order_candidate)
-                    except Exception:
-                        order_idx = None
-
-                if order_idx is None or len(order_idx) == 0:
-                    raise ValueError(
-                        "feature_importance_fn non ha restituito un ordine valido né un vettore di importanze interpretabile."
-                    )
-
-            else:
-                if self.feature_order is None:
-                    order_idx = list(range(p))
-                else:
-                    order_idx = []
-                    for o in self.feature_order:
-                        if o in colmap:
-                            order_idx.append(int(colmap[o]))
-                        else:
-                            order_idx.append(int(o))
-
-            order_idx = order_idx[:T]
-
-        elif self.selection != "greedy":
-            raise ValueError("selection deve essere 'static' o 'greedy'.")
-
-        if self.selection == "greedy":
-            k = max(1, int(round(math.sqrt(p)))) if not hasattr(self, "feature_subsample") or self.feature_subsample is None \
-                else int(min(max(1, self.feature_subsample), p))
-
-        no_improve_rounds = 0
-        worsening_rounds = 0
-
-        for t in range(1, T + 1):
-            residual = y_tr - expit(F_tr)
-
-            if self.selection == "static":
-                i = order_idx[t - 1]
-                tree = DecisionTreeRegressor(max_depth=self.max_depth, random_state=self.random_state)
-                tree.fit(X_tr[:, [i]], residual)
-                delta_tr = tree.predict(X_tr[:, [i]])
-                F_tr = F_tr + self.lr * delta_tr
-                chosen = (i, tree)
-
-            else:
-                remaining = [j for j in range(p) if j not in self.used_features_]
-                if len(remaining) == 0:
-                    break
-                if len(remaining) > k:
-                    cand = self._rng().choice(remaining, size=k, replace=False)
-                else:
-                    cand = np.array(remaining, dtype=int)
-
-                best_loss = np.inf
-                chosen = None
-                best_pred = None
-                for i in cand:
-                    tree = DecisionTreeRegressor(max_depth=self.max_depth, random_state=self.random_state)
-                    tree.fit(X_tr[:, [i]], residual)
-                    pred = tree.predict(X_tr[:, [i]])
-                    loss = self._greedy_loss(y_tr, F_tr + self.lr * pred, self.greedy_metric, self.epsilon)
-                    if loss < best_loss:
-                        best_loss = loss
-                        chosen = (i, tree)
-                        best_pred = pred
-
-                F_tr = F_tr + self.lr * best_pred
-
-            i, tree = chosen
-            self.models_.append((i, tree))
-            self.used_features_.append(i)
-
-            if self.early_stopping:
-                F_val = F_val + self.lr * tree.predict(X_val[:, [i]])
-                val_score = self._score_from_margin(F_val, y_val, self.early_stopping_metric, self.threshold, self.epsilon)
-                self.validation_scores_.append(val_score)
-
-                if self.verbose:
-                    print(f"Iter {t}: val_{self.early_stopping_metric}={val_score:.6f}")
-
-                improved = (best_score is None) or (val_score > best_score + self.tol)
-                worsened = (prev_score is not None) and (val_score < prev_score - self.tol)
-
-                if improved:
-                    best_score = val_score
-                    best_iter = t
-                    no_improve_rounds = 0
-                else:
-                    no_improve_rounds += 1
-
-                if worsened:
-                    worsening_rounds += 1
-                else:
-                    worsening_rounds = 0
-
-                if no_improve_rounds >= self.patience:
-                    if self.verbose:
-                        print(f"Early stopping at iter {t}: no improvement for {self.patience} iterations."
-                              f"(best_iter={best_iter}, best_score={best_score:.6f})")
-                    self.stop_reason_ = "no_improve"
-                    break
-
-                if worsening_rounds >= self.patience:
-                    if self.verbose:
-                        print(f"Early stopping at iter {t}: worsening for {self.patience} iterations."
-                              f"(best_iter={best_iter}, best_score={best_score:.6f})")
-                    self.stop_reason_ = "worsening"
-                    break
-
-                prev_score = val_score
-
-        if self.early_stopping:
-            self.models_ = self.models_[:best_iter]
-            self.used_features_ = self.used_features_[:best_iter]
-            self.best_iteration_ = best_iter
-            self.best_score_ = best_score
-
-        self.n_estimators_ = len(self.models_)
-        return self
-
-    def decision_function(self, X: ArrayLike) -> np.ndarray:
-        X = check_array(X, dtype=float)
-        F = np.full(X.shape[0], self.log_odds_p0_, dtype=float)
-        for i, tree in self.models_:
-            F += self.lr * tree.predict(X[:, [i]])
-        return F
-
-    def predict_proba(self, X: ArrayLike) -> np.ndarray:
-        F = self.decision_function(X)
-        p1 = expit(F)
-        return np.column_stack([1 - p1, p1])
-
-    def predict(self, X: ArrayLike) -> np.ndarray:
-        return (self.predict_proba(X)[:, 1] >= self.threshold).astype(int)
-
-    def get_used_features(self) -> List:
-        if self.feature_names_in_ is None:
-            return [i for i, _ in self.models_]
-        return [self.feature_names_in_[i] for i, _ in self.models_]
-
-    def get_early_stopping_info(self) -> dict:
-        return {
-            "early_stopping_used": self.early_stopping,
-            "best_iteration": self.best_iteration_ if self.early_stopping else None,
-            "best_score": self.best_score_ if self.early_stopping else None,
-            "final_estimators": self.n_estimators_,
-            "validation_scores": self.validation_scores_ if self.early_stopping else [],
-            "early_stopping_metric": self.early_stopping_metric if self.early_stopping else None,
-            "patience": self.patience if self.early_stopping else None,
-            "stop_reason": self.stop_reason_ if self.early_stopping else None,
-        }
-
-"""
-################## PAIRWISE INTERACTIONS ##################
-"""
+# ================ MODEL =======================
 def _sigmoid(z):
     out = np.empty_like(z, dtype=float)
     pos = z >= 0
@@ -1422,340 +1044,1156 @@ class Model2D(ClassifierMixin, BaseEstimator):
         t.fit(Xij, residual, sample_weight=sample_weight)
         return t, t.predict(Xij)
 
+# ============ EXPERIMENTS ============
 
+from sklearn.metrics import classification_report
+data   = load_preprocess('loan')
+X, y   = data["X"], data["y"]
+scaler = data["scaler"]
 
-import time
-import numpy as np
-from tqdm import tqdm
 import pandas as pd
-from typing import List, Dict, Tuple, Optional
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import (
-    roc_auc_score, f1_score, balanced_accuracy_score,
-    matthews_corrcoef, accuracy_score
+from utils import get_feature_importance
+X = pd.DataFrame(X, columns=scaler.feature_names_in_)
+
+X_tc, X_test, y_tc, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=110
 )
-from scipy.stats import wilcoxon
-from utils import get_available_datasets, load_preprocess, get_feature_importance
+X_train, X_cal, y_train, y_cal = train_test_split(
+    X_tc, y_tc, test_size=0.1, stratify=y_tc, random_state=17
+)
 
-all_data = get_available_datasets()
-datasets = []
-for name, info in all_data.items():
-    _data = load_preprocess(name)
-    datasets.append({"name": name, "X": _data["X"], "y": _data["y"]})
-
-BASE_PARAMS = dict(
-    max_depth=2,
-    lr=1.0,
+clf = Model2D(
+    max_depth=3,
+    lr=0.1,
     selection="greedy",
-    early_stopping=True,
-    early_stopping_metric="auc",
-    validation_fraction=0.2,
-    patience=5,
-    tol=1e-4,
-    random_state=42,
-    epsilon=1e-12,
-    verbose=0,
-    fast_bins=8,
-    cache_refresh_every=1,
-    fast_refresh_every=5
+    group_mode="mixed",
+    cache_refresh_every=10,
+    fast_refresh_every=5,
+    feature_importance_fn=get_feature_importance,
+    verbose=1
+) # best config for "loan" dataset
+clf.fit(X_train, y_train)
+print("METRICS")
+print(classification_report(y_test, clf.predict(X_test), digits=2))
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Any
+
+
+def extract_stage_rules_structured(clf, feature_names, X: pd.DataFrame, y: np.ndarray, min_support: int = 10):
+
+    from sklearn.tree import _tree
+    rules = []
+    n = len(X)
+
+    for stage_idx, stage in enumerate(clf.stages_):
+        tree_ = stage.tree.tree_
+        feats_local2global = stage.feats
+
+        def feat_name(local_idx):
+            if local_idx == _tree.TREE_UNDEFINED:
+                return "undefined!"
+            return feature_names[feats_local2global[local_idx]]
+
+        def recurse(node, conds):
+            f = tree_.feature[node]
+            if f != _tree.TREE_UNDEFINED:
+                name = feat_name(f)
+                thr = float(tree_.threshold[node])
+                recurse(tree_.children_left[node],  conds + [(name, "<=", thr)])
+                recurse(tree_.children_right[node], conds + [(name, ">",  thr)])
+            else:
+                bounds: Dict[str, Dict[str, float]] = {}
+                for name, op, thr in conds:
+                    b = bounds.setdefault(name, {"lb": -np.inf, "ub": np.inf})
+                    if op == ">":
+                        b["lb"] = max(b["lb"], thr)
+                    else:
+                        b["ub"] = min(b["ub"], thr)
+
+                mask = np.ones(n, dtype=bool)
+                pretty = []
+                used_feats = []
+                for name, b in bounds.items():
+                    lb, ub = b["lb"], b["ub"]
+                    col = name
+                    used_feats.append(name)
+                    if np.isneginf(lb) and np.isposinf(ub):
+                        pretty.append(f"{name}: any")
+                    elif np.isneginf(lb):
+                        pretty.append(f"{name} <= {ub:.12f}")
+                        mask &= (X[col] <= ub)
+                    elif np.isposinf(ub):
+                        pretty.append(f"{name} > {lb:.12f}")
+                        mask &= (X[col] >  lb)
+                    else:
+                        if not (lb < ub):
+                            return
+                        pretty.append(f"{lb:.12f} < {name} <= {ub:.12f}")
+                        mask &= (X[col] > lb) & (X[col] <= ub)
+
+                if not bounds:
+                    pretty.append("TRUE")
+                    mask &= True
+
+                support = int(mask.sum())
+                if support == 0:
+                    return
+
+                pos_rate = float(y[mask].mean()) if support > 0 else np.nan
+                weight_leaf = float(tree_.value[node][0][0])
+                stage_lr = getattr(stage, "learning_rate", 1.0)
+                weight_eff = weight_leaf * stage_lr
+                rules.append({
+                    "stage": stage_idx,
+                    "kind": stage.kind,
+                    "features": tuple(sorted(used_feats)) if used_feats else tuple(),
+                    "bounds": {k: dict(v) for k,v in bounds.items()},
+                    "expr": " AND ".join(pretty),
+                    "weight": weight_eff,
+                    "support": support,
+                    "pos_rate": pos_rate
+                })
+
+        recurse(0, [])
+
+    rules_df = pd.DataFrame(rules).sort_values(["stage","features","expr"]).reset_index(drop=True)
+
+    # if min_support < 1, interpreted as percentage (fraction of the dataset)
+    if 0 < min_support < 1:
+        abs_min_support = int(np.ceil(min_support * n))
+    else:
+        abs_min_support = int(min_support)
+
+    rules_df = rules_df[rules_df["support"] >= abs_min_support].reset_index(drop=True)
+
+    return rules_df
+
+feature_names = clf.feature_names_in_
+rules_df = extract_stage_rules_structured(
+    clf, feature_names, X_train, y_train, min_support=0.05)
+print(rules_df)
+
+def weights_to_points(rules_df, *,
+                      PDO=50, score0=100, odds0=50,
+                      lr_by_stage=None,
+                      base_log_odds=None):
+    """
+    rules_df: (from extract_stage_rules_structured) with 'weight' and 'stage'.
+    PDO, score0, odds0: parameters to define the score scale.
+    lr_by_stage: dict {stage_idx: lr} or single float; if None -> 1.0
+    base_log_odds: if F(x) already includes the base term, you can leave it None.
+                   If you want to make it explicit: base_log_odds = log(p0/(1-p0)).
+    Returns: rules_df with 'points', and scaling constants (factor, offset, base_points).
+    """
+    factor = PDO / np.log(2.0)
+    offset = score0 - factor * np.log(float(odds0))
+
+    if lr_by_stage is None:
+        def lr_of(stage): return 1.0
+    elif isinstance(lr_by_stage, (int, float)):
+        def lr_of(stage): return float(lr_by_stage)
+    else:
+        def lr_of(stage): return float(lr_by_stage.get(stage, 1.0))
+
+    df = rules_df.copy()
+    df["lr"] = df["stage"].map(lambda s: lr_of(int(s)))
+    df["weight_eff"] = df["weight"] * df["lr"]
+    df["points"] = np.rint(factor * df["weight_eff"]).astype(int)
+
+    base_points = int(np.rint(offset + factor * (base_log_odds or 0.0)))
+    df = df[df["points"] != 0].reset_index(drop=True)
+    return df, float(factor), float(offset), int(base_points)
+
+p0 = float(y_train.mean())
+base_log_odds = np.log(p0/(1-p0))
+
+odds0 = p0/(1-p0)
+
+rules_df_points, factor, offset, base_points = weights_to_points(
+    rules_df,
+    PDO=50, score0=100, odds0=odds0,
+    lr_by_stage=1.0,
+    base_log_odds=base_log_odds
+)
+print(rules_df_points)
+
+def _expit(x):
+    x = np.asarray(x, dtype=float)
+    return np.where(x >= 0, 1.0/(1.0+np.exp(-x)), np.exp(x)/(1.0+np.exp(x)))
+
+def predict_proba(x, *, factor, offset, input_type='score'):
+    x = np.asarray(x, dtype=float)
+    if input_type == 'score':
+        z = (x - float(offset)) / float(factor)
+    elif input_type == 'margin':
+        z = x
+    else:
+        raise ValueError("input_type deve essere 'score' o 'margin'.")
+    p1 = _expit(z)
+    return np.column_stack([1.0 - p1, p1])
+
+def predict_class(x, *, factor, offset, input_type='score', p1_threshold=0.5):
+    p1 = predict_proba(x, factor=factor, offset=offset, input_type=input_type)[:, 1]
+    return (p1 >= float(p1_threshold)).astype(int)
+
+def _to_inf(v, default):
+    if v is None: return default
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ('-inf', '-infty', '-infinite'): return -np.inf
+        if s in ('inf', '+inf', 'infty', 'infinite'): return np.inf
+    return float(v)
+
+def make_activation_matrix(X, rules_df, bounds_col='bounds', on_missing='error', return_sparse=False, dtype=np.int8):
+    """
+    X: pandas DataFrame
+    on_missing: 'error' -> KeyError if missing feature; 'ignore' -> treat as False
+    return_sparse: if True try to return csr_matrix, otherwise ndarray
+    """
+    import numpy as np
+    n = len(X)
+    m = len(rules_df)
+    is_sparse = False
+    if return_sparse:
+        try:
+            from scipy.sparse import lil_matrix
+            A = lil_matrix((n, m), dtype=dtype)
+            is_sparse = True
+        except Exception:
+            A = np.zeros((n, m), dtype=dtype)
+    else:
+        A = np.zeros((n, m), dtype=dtype)
+
+    for j, (_, row) in enumerate(rules_df.iterrows()):
+        spec = row[bounds_col]
+        if spec is None or (isinstance(spec, float) and np.isnan(spec)):
+            mask = np.zeros(n, dtype=bool)
+        else:
+            mask = np.ones(n, dtype=bool)
+            for feat, cond in spec.items():
+                if feat not in X.columns:
+                    if on_missing == 'error':
+                        raise KeyError(f"Feature '{feat}' assente in X.")
+                    else:
+                        mask &= False
+                        continue
+
+                col = X[feat]
+
+                if isinstance(cond, dict) and ('lb' in cond or 'ub' in cond):
+                    lb = _to_inf(cond.get('lb', None), -np.inf)
+                    ub = _to_inf(cond.get('ub', None),  np.inf)
+                    lb_inc = bool(cond.get('lb_inclusive', False))
+                    ub_inc = bool(cond.get('ub_inclusive', True))
+                    if lb_inc:
+                        m1 = (col >= lb)
+                    else:
+                        m1 = (col > lb)
+                    if ub_inc:
+                        m2 = (col <= ub)
+                    else:
+                        m2 = (col < ub)
+                    cond_mask = m1 & m2
+                elif isinstance(cond, dict) and 'values' in cond:
+                    vals = cond['values']
+                    cond_mask = col.isin(vals)
+                else:
+                    raise ValueError(f"Spec non riconosciuta per '{feat}': {cond}")
+                cond_mask = cond_mask.to_numpy(dtype=bool, copy=False)
+                isna_col = pd.isna(col).to_numpy()
+                cond_mask &= ~isna_col
+                mask &= cond_mask
+
+        if is_sparse:
+            idx = np.where(mask)[0]
+            if len(idx):
+                A[idx, j] = 1
+        else:
+            A[:, j] = mask.astype(dtype, copy=False)
+
+    if is_sparse:
+        return A.tocsr()
+    return A
+
+def score_from_points(A, points, base_points):
+    pts = np.asarray(points, dtype=int)
+    if A.shape[1] != pts.shape[0]:
+        raise ValueError(f"Dimensioni non coerenti: A.shape[1]={A.shape[1]} vs len(points)={pts.shape[0]}")
+    return int(base_points) + (A @ pts)
+
+def predict_from_scorecard(X, *, rules_df_points, factor, offset, base_points, p1_threshold=0.5,
+                           bounds_col='bounds', on_missing='error', return_sparse=True):
+
+    A = make_activation_matrix(X, rules_df_points, bounds_col=bounds_col,
+                               on_missing=on_missing, return_sparse=return_sparse)
+    S = score_from_points(A, rules_df_points["points"].to_numpy(), base_points)
+    proba = predict_proba(S, factor=factor, offset=offset, input_type='score')
+    yhat  = predict_class(S, factor=factor, offset=offset, input_type='score', p1_threshold=p1_threshold)
+    return S, proba, yhat
+
+S, proba, yhat = predict_from_scorecard(
+    X_test,
+    rules_df_points=rules_df_points,
+    factor=factor,
+    offset=offset,
+    base_points=base_points,
+    p1_threshold=0.5,
+    bounds_col='bounds',
+    on_missing='ignore',
+    return_sparse=True
 )
 
-PARAMS_UNIVARIATE = dict(**BASE_PARAMS, group_mode="univariate")
-PARAMS_PAIRWISE   = dict(**BASE_PARAMS, group_mode="pairwise",
-                         allow_pair_reuse=False)
-PARAMS_MIXED      = dict(**BASE_PARAMS, group_mode="mixed",
-                         allow_pair_reuse=False, block_univariate_if_in_pair=True)
+print("== Report (scores only) ==")
+print(classification_report(y_test, yhat, digits=2))
+print("AUC (scores):", roc_auc_score(y_test, proba[:, 1]))
 
-MODEL_PARAMS = {
-    "univariate": PARAMS_UNIVARIATE,
-    "pairwise":   PARAMS_PAIRWISE,
-    "mixed":      PARAMS_MIXED,
-}
+print("== ORIGINAL MODEL ==")
+print(classification_report(y_test, clf.predict(X_test), digits=2))
+print("AUC (original):", roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1]))
 
-PAIRS = [
-    ("pairwise", "univariate"),
-    ("mixed", "univariate"),
-    ("mixed", "pairwise"),
-]
+import numpy as np
+m_model = np.log(clf.predict_proba(X_test)[:,1] / (1 - clf.predict_proba(X_test)[:,1] + 1e-12))
+A_te = make_activation_matrix(X_test, rules_df_points, on_missing='ignore', return_sparse=True)
+S_te = score_from_points(A_te, rules_df_points["points"].to_numpy(), base_points)
 
-METRICS = ["auc", "f1", "balanced_accuracy", "mcc", "accuracy"]
+corr = np.corrcoef(m_model, S_te)[0,1]
+print("corr(original model, scorecard) =", corr)
 
-def _ensure_binary_numpy_y(y):
-    y_np = y.values if hasattr(y, "values") else np.asarray(y)
-    uniq = np.unique(y_np)
-    if set(uniq.tolist()) == {0, 1}:
-        return y_np.astype(int)
-    if len(uniq) != 2:
-        raise ValueError(f"y non binaria (trovate {len(uniq)} classi): {uniq}")
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder()
-    y_enc = le.fit_transform(y_np)
-    if set(np.unique(y_enc)) != {0, 1}:
-        y_enc = (y_enc == y_enc.max()).astype(int)
-    return y_enc
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from matplotlib import pyplot as plt
 
-def _split_index(X, y, tr_idx, te_idx):
-    if hasattr(X, "iloc"):
-        Xtr, Xte = X.iloc[tr_idx], X.iloc[te_idx]
+prob_true, prob_pred = calibration_curve(y_test, proba[:, 1], n_bins=10)
+
+plt.figure(figsize=(5, 3))
+plt.plot([0, 1], [0, 1], linestyle='--', label='Perfectly calibrated')
+plt.plot(prob_pred, prob_true, marker='.', label='Uncalibrated')
+plt.xlabel('Mean predicted probability')
+plt.ylabel('True probability')
+plt.title('Calibration Curve (Reliability Diagram)')
+plt.legend()
+plt.show()
+
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import roc_auc_score, brier_score_loss, classification_report, log_loss
+
+def _expit(x):
+    x = np.asarray(x, dtype=float)
+    return np.where(x >= 0, 1.0/(1.0+np.exp(-x)), np.exp(x)/(1.0+np.exp(x)))
+
+def margin_from_factor_offset(S, factor, offset):
+    # z = (S - offset)/factor  -> "margine" / logit non calibrato
+    return (np.asarray(S, float) - float(offset)) / float(factor)
+
+def proba_from_factor_offset(S, factor, offset):
+    return _expit(margin_from_factor_offset(S, factor, offset))
+
+class ScorecardCalibratorCV:
+    def __init__(self, method='platt', n_splits=5, random_state=42,
+                 class_weight=None, max_iter=2000, factor=None, offset=None,
+                 refit_full=True):
+        assert method in ('platt', 'isotonic')
+        self.method = method
+        self.n_splits = n_splits
+        self.random_state = random_state
+        self.class_weight = class_weight
+        self.max_iter = max_iter
+        self.factor = factor
+        self.offset = offset
+        self.refit_full = refit_full
+
+        self.calibrator_ = None # ('platt', w, b) or ('isotonic', iso)
+        self.p1_oof_ = None
+        self.metrics_ = {}
+
+    def _to_margin(self, S):
+        if self.factor is not None and self.offset is not None:
+            return margin_from_factor_offset(S, self.factor, self.offset)
+        return np.asarray(S, float)
+
+    def _to_prob01(self, S):
+        if self.factor is not None and self.offset is not None:
+            return proba_from_factor_offset(S, self.factor, self.offset)
+        S = np.asarray(S, float)
+        return np.clip(S, 1e-6, 1-1e-6)
+
+    def fit(self, S, y):
+        S = np.asarray(S).reshape(-1)
+        y = np.asarray(y).reshape(-1)
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True,
+                              random_state=self.random_state)
+
+        p1_oof = np.zeros_like(S, dtype=float)
+
+        for tr_idx, va_idx in skf.split(S, y):
+            S_tr, S_va = S[tr_idx], S[va_idx]
+            y_tr = y[tr_idx]
+
+            if self.method == 'platt':
+                X_tr = self._to_margin(S_tr).reshape(-1, 1)
+                lr = LogisticRegression(penalty='l2', solver='saga',
+                                        class_weight=self.class_weight,
+                                        max_iter=self.max_iter)
+                lr.fit(X_tr, y_tr)
+                w = float(lr.coef_[0, 0]); b = float(lr.intercept_[0])
+                p1_oof[va_idx] = _expit(w * self._to_margin(S_va) + b)
+
+            else:
+                iso = IsotonicRegression(out_of_bounds='clip',
+                                         y_min=0.0, y_max=1.0)
+                iso.fit(self._to_prob01(S_tr), y_tr)
+                p1_oof[va_idx] = iso.predict(self._to_prob01(S_va))
+
+        self.p1_oof_ = p1_oof
+        self.metrics_ = {
+            'auc_oof'   : float(roc_auc_score(y, p1_oof)),
+            'brier_oof' : float(brier_score_loss(y, p1_oof)),
+            'logloss_oof': float(log_loss(y, p1_oof))
+        }
+
+        if self.refit_full:
+            if self.method == 'platt':
+                lr = LogisticRegression(penalty='l2', solver='saga',
+                                        class_weight=self.class_weight,
+                                        max_iter=self.max_iter)
+                lr.fit(self._to_margin(S).reshape(-1,1), y)
+                w = float(lr.coef_[0, 0]); b = float(lr.intercept_[0])
+                self.calibrator_ = ('platt', w, b)
+            else:
+                iso = IsotonicRegression(out_of_bounds='clip',
+                                         y_min=0.0, y_max=1.0)
+                iso.fit(self._to_prob01(S), y)
+                self.calibrator_ = ('isotonic', iso)
+        else:
+            self.calibrator_ = None
+
+        return self
+
+    def predict_proba(self, S):
+        S = np.asarray(S).reshape(-1)
+        if self.calibrator_ is None:
+            raise RuntimeError("Calibrator not found.")
+        kind = self.calibrator_[0]
+        if kind == 'platt':
+            _, w, b = self.calibrator_
+            p1 = _expit(w * self._to_margin(S) + b)
+        else:
+            _, iso = self.calibrator_
+            p1 = iso.predict(self._to_prob01(S))
+        return np.column_stack([1.0 - p1, p1])
+
+    def predict(self, S, threshold=0.5):
+        p1 = self.predict_proba(S)[:, 1]
+        return (p1 >= float(threshold)).astype(int)
+
+S_train, _, _ = predict_from_scorecard(
+    X_train,
+    rules_df_points=rules_df_points,
+    factor=factor, offset=offset,
+    base_points=base_points,
+    bounds_col='bounds',
+    on_missing='ignore',
+    return_sparse=True
+)
+S_train = np.asarray(S_train).reshape(-1)
+
+cal_cv = ScorecardCalibratorCV(method='isotonic',
+                               n_splits=5, random_state=42,
+                               factor=factor, offset=offset,
+                               refit_full=True)
+cal_cv.fit(S_train, y_train)
+print("Metrics:", cal_cv.metrics_)
+
+S_test, _, _ = predict_from_scorecard(
+    X_test,
+    rules_df_points=rules_df_points,
+    factor=factor, offset=offset,
+    base_points=base_points,
+    bounds_col='bounds',
+    on_missing='ignore',
+    return_sparse=True
+)
+S_test = np.asarray(S_test).reshape(-1)
+
+proba_test = cal_cv.predict_proba(S_test)[:, 1]
+yhat_test = (proba_test >= 0.5).astype(int)
+
+print("== Scorecard (after calibration) - ISOTONIC ==")
+print(classification_report(y_test, yhat_test, digits=2))
+print("AUC:",   roc_auc_score(y_test, proba_test))
+print("Brier:", brier_score_loss(y_test, proba_test))
+print("LogLoss:", log_loss(y_test, proba_test))
+
+p_uncal_test = proba_from_factor_offset(S_test, factor, offset)
+yhat_uncal = (p_uncal_test >= 0.5).astype(int)
+print("\n== Baseline model (uncalibrated) ==")
+print(classification_report(y_test, yhat_uncal, digits=2))
+print("AUC:",   roc_auc_score(y_test, p_uncal_test))
+print("Brier:", brier_score_loss(y_test, p_uncal_test))
+print("LogLoss:", log_loss(y_test, p_uncal_test))
+
+cal_cv_platt = ScorecardCalibratorCV(method='platt',
+                               n_splits=5, random_state=42,
+                               factor=factor, offset=offset,
+                               refit_full=True)
+cal_cv_platt.fit(S_train, y_train)
+print("Metrics:", cal_cv_platt.metrics_)
+
+proba_test = cal_cv_platt.predict_proba(S_test)[:, 1]
+yhat_test = (proba_test >= 0.5).astype(int)
+
+print("== Scorecard (after calibration) - PLATT ==")
+print(classification_report(y_test, yhat_test, digits=2))
+print("AUC:",   roc_auc_score(y_test, proba_test))
+print("Brier:", brier_score_loss(y_test, proba_test))
+print("LogLoss:", log_loss(y_test, proba_test))
+
+p_uncal_test = proba_from_factor_offset(S_test, factor, offset)
+yhat_uncal = (p_uncal_test >= 0.5).astype(int)
+print("\n== Baseline model (uncalibrated) ==")
+print(classification_report(y_test, yhat_uncal, digits=2))
+print("AUC:",   roc_auc_score(y_test, p_uncal_test))
+print("Brier:", brier_score_loss(y_test, p_uncal_test))
+print("LogLoss:", log_loss(y_test, p_uncal_test))
+
+# =========================
+#       SCORECARD
+# =========================
+@dataclass
+class Scorecard:
+    rules_df_points: pd.DataFrame
+    factor: float
+    offset: float
+    base_points: int
+    bounds_col: str = 'bounds'
+    on_missing: str = 'error' # 'error' | 'ignore'
+    return_sparse: bool = True
+    calibrator_: Optional[ScorecardCalibratorCV] = None 
+
+    @staticmethod
+    def extract_stage_rules_structured(clf, feature_names, X: pd.DataFrame, y: np.ndarray, min_support: int = 10):
+        from sklearn.tree import _tree
+        rules = []
+        n = len(X)
+
+        for stage_idx, stage in enumerate(clf.stages_):
+            tree_ = stage.tree.tree_
+            feats_local2global = stage.feats
+
+            def feat_name(local_idx):
+                if local_idx == _tree.TREE_UNDEFINED:
+                    return "undefined!"
+                return feature_names[feats_local2global[local_idx]]
+
+            def recurse(node, conds):
+                f = tree_.feature[node]
+                if f != _tree.TREE_UNDEFINED:
+                    name = feat_name(f)
+                    thr = float(tree_.threshold[node])
+                    recurse(tree_.children_left[node],  conds + [(name, "<=", thr)])
+                    recurse(tree_.children_right[node], conds + [(name, ">",  thr)])
+                else:
+                    bounds: Dict[str, Dict[str, float]] = {}
+                    for name, op, thr in conds:
+                        b = bounds.setdefault(name, {"lb": -np.inf, "ub": np.inf})
+                        if op == ">":
+                            b["lb"] = max(b["lb"], thr)
+                        else:
+                            b["ub"] = min(b["ub"], thr)
+
+                    mask = np.ones(n, dtype=bool)
+                    pretty = []
+                    used_feats = []
+                    for name, b in bounds.items():
+                        lb, ub = b["lb"], b["ub"]
+                        col = name
+                        used_feats.append(name)
+                        # half-open/closed per evitare doppie contiguità
+                        if np.isneginf(lb) and np.isposinf(ub):
+                            pretty.append(f"{name}: any")
+                        elif np.isneginf(lb):
+                            pretty.append(f"{name} <= {ub:.12f}")
+                            mask &= (X[col] <= ub)
+                        elif np.isposinf(ub):
+                            pretty.append(f"{name} > {lb:.12f}")
+                            mask &= (X[col] >  lb)
+                        else:
+                            if not (lb < ub):
+                                return
+                            pretty.append(f"{lb:.12f} < {name} <= {ub:.12f}")
+                            mask &= (X[col] > lb) & (X[col] <= ub)
+
+                    if not bounds:
+                        pretty.append("TRUE")
+                        mask &= True
+
+                    support = int(mask.sum())
+                    if support == 0:
+                        return
+
+                    pos_rate = float(y[mask].mean()) if support > 0 else np.nan
+                    weight_leaf = float(tree_.value[node][0][0])
+                    stage_lr = getattr(stage, "learning_rate", 1.0)
+                    weight_eff = weight_leaf * stage_lr
+                    rules.append({
+                        "stage": stage_idx,
+                        "kind": stage.kind,
+                        "features": tuple(sorted(used_feats)) if used_feats else tuple(),
+                        "bounds": {k: dict(v) for k,v in bounds.items()},
+                        "expr": " AND ".join(pretty),
+                        "weight": weight_eff,
+                        "support": support,
+                        "pos_rate": pos_rate
+                    })
+
+            recurse(0, [])
+
+        rules_df = pd.DataFrame(rules).sort_values(["stage","features","expr"]).reset_index(drop=True)
+
+        # if min_support < 1, interpreted as percentage (fraction of the dataset)
+        if 0 < min_support < 1:
+            abs_min_support = int(np.ceil(min_support * n))
+        else:
+            abs_min_support = int(min_support)
+
+        rules_df = rules_df[rules_df["support"] >= abs_min_support].reset_index(drop=True)
+
+        return rules_df
+
+    @staticmethod
+    def weights_to_points(rules_df, *,
+                        PDO=50, score0=100, odds0=50,
+                        lr_by_stage=None,
+                        base_log_odds=None):
+        """
+        rules_df: (from extract_stage_rules_structured) with 'weight' and 'stage'.
+        PDO, score0, odds0: parameters to define the score scale.
+        lr_by_stage: dict {stage_idx: lr} or single float; if None -> 1.0
+        base_log_odds: if F(x) already includes the base term, you can leave it None.
+                    If you want to make it explicit: base_log_odds = log(p0/(1-p0)).
+        Returns: rules_df with 'points', and scaling constants (factor, offset, base_points).
+        """
+        factor = PDO / np.log(2.0)
+        offset = score0 - factor * np.log(float(odds0))
+
+        if lr_by_stage is None:
+            def lr_of(stage): return 1.0
+        elif isinstance(lr_by_stage, (int, float)):
+            def lr_of(stage): return float(lr_by_stage)
+        else:
+            def lr_of(stage): return float(lr_by_stage.get(stage, 1.0))
+
+        df = rules_df.copy()
+        df["lr"] = df["stage"].map(lambda s: lr_of(int(s)))
+        df["weight_eff"] = df["weight"] * df["lr"]
+        df["points"] = np.rint(factor * df["weight_eff"]).astype(int)
+
+        base_points = int(np.rint(offset + factor * (base_log_odds or 0.0)))
+        df = df[df["points"] != 0].reset_index(drop=True)
+        return df, float(factor), float(offset), int(base_points)
+
+    @classmethod
+    def from_model(cls,
+                   clf: Any,
+                   X_train: pd.DataFrame,
+                   y_train: np.ndarray,
+                   *,
+                   feature_names: Optional[pd.Index] = None,
+                   min_support: Union[int, float] = 0.005,
+                   PDO: int = 50,
+                   score0: float = 100.0,
+                   odds0: Optional[float] = None,
+                   lr_by_stage: Optional[Union[float, Dict[int, float]]] = 1.0,
+                   bounds_col: str = 'bounds',
+                   on_missing: str = 'ignore',
+                   return_sparse: bool = True
+                  ) -> "Scorecard":
+        if feature_names is None:
+            feature_names = getattr(clf, "feature_names_in_", None)
+            if feature_names is None:
+                raise ValueError("feature_names non forniti e non presenti nel modello.")
+        feature_names = pd.Index(feature_names)
+
+        rules_df = cls.extract_stage_rules_structured(
+            clf, feature_names, X_train, y_train, min_support=min_support
+        )
+
+        p0 = float(np.asarray(y_train).mean())
+        base_log_odds = np.log(p0/(1-p0))
+        if odds0 is None:
+            odds0 = p0/(1-p0)
+
+        rules_df_points, factor, offset, base_points = cls.weights_to_points(
+            rules_df, PDO=PDO, score0=score0, odds0=odds0,
+            lr_by_stage=lr_by_stage, base_log_odds=base_log_odds
+        )
+
+        return cls(
+            rules_df_points=rules_df_points,
+            factor=factor, offset=offset, base_points=base_points,
+            bounds_col=bounds_col, on_missing=on_missing, return_sparse=return_sparse
+        )
+
+    @staticmethod
+    def make_activation_matrix(X, rules_df, bounds_col='bounds', on_missing='error', return_sparse=False, dtype=np.int8):
+        import numpy as np
+        n = len(X)
+        m = len(rules_df)
+        is_sparse = False
+        if return_sparse:
+            try:
+                from scipy.sparse import lil_matrix
+                A = lil_matrix((n, m), dtype=dtype)
+                is_sparse = True
+            except Exception:
+                A = np.zeros((n, m), dtype=dtype)
+        else:
+            A = np.zeros((n, m), dtype=dtype)
+
+        for j, (_, row) in enumerate(rules_df.iterrows()):
+            spec = row[bounds_col]
+            if spec is None or (isinstance(spec, float) and np.isnan(spec)):
+                mask = np.zeros(n, dtype=bool)
+            else:
+                mask = np.ones(n, dtype=bool)
+                for feat, cond in spec.items():
+                    if feat not in X.columns:
+                        if on_missing == 'error':
+                            raise KeyError(f"Feature '{feat}' assente in X.")
+                        else:
+                            mask &= False
+                            continue
+
+                    col = X[feat]
+                    if isinstance(cond, dict) and ('lb' in cond or 'ub' in cond):
+                        lb = _to_inf(cond.get('lb', None), -np.inf)
+                        ub = _to_inf(cond.get('ub', None),  np.inf)
+                        lb_inc = bool(cond.get('lb_inclusive', False))
+                        ub_inc = bool(cond.get('ub_inclusive', True))
+                        if lb_inc:
+                            m1 = (col >= lb)
+                        else:
+                            m1 = (col > lb)
+                        if ub_inc:
+                            m2 = (col <= ub)
+                        else:
+                            m2 = (col < ub)
+                        cond_mask = m1 & m2
+                    elif isinstance(cond, dict) and 'values' in cond:
+                        vals = cond['values']
+                        cond_mask = col.isin(vals)
+                    else:
+                        raise ValueError(f"Spec non riconosciuta per '{feat}': {cond}")
+                    cond_mask = cond_mask.to_numpy(dtype=bool, copy=False)
+                    isna_col = pd.isna(col).to_numpy()
+                    cond_mask &= ~isna_col
+                    mask &= cond_mask
+
+            if is_sparse:
+                idx = np.where(mask)[0]
+                if len(idx):
+                    A[idx, j] = 1
+            else:
+                A[:, j] = mask.astype(dtype, copy=False)
+
+        if is_sparse:
+            return A.tocsr()
+        return A
+
+    @property
+    def points_(self) -> np.ndarray:
+        return self.rules_df_points["points"].to_numpy()
+
+    def predict_scores(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        score = (base_points + sum of points of active rules).
+        """
+        A = make_activation_matrix(
+            X,
+            self.rules_df_points,
+            bounds_col=self.bounds_col,
+            on_missing=self.on_missing,
+            return_sparse=self.return_sparse
+        )
+        pts = self.points_
+        S = int(self.base_points) + (A @ pts)
+        return np.asarray(S).reshape(-1)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        S = self.predict_scores(X)
+        if self.calibrator_ is not None:
+            return self.calibrator_.predict_proba(S)
+        p1 = proba_from_factor_offset(S, self.factor, self.offset)
+        return np.column_stack([1.0 - p1, p1])
+
+    def predict(self, X: pd.DataFrame, threshold: float = 0.5) -> np.ndarray:
+        proba = self.predict_proba(X)[:, 1]
+        return (proba >= float(threshold)).astype(int)
+
+    def fit_calibrator(self, X: pd.DataFrame, y: np.ndarray, *,
+                    method: str = 'platt', n_splits: int = 5,
+                    random_state: int = 42, class_weight=None, max_iter: int = 2000):
+
+        S = self.predict_scores(X)
+        cal = ScorecardCalibratorCV(method=method, n_splits=n_splits,
+                                    random_state=random_state, class_weight=class_weight,
+                                    max_iter=max_iter,
+                                    factor=self.factor, offset=self.offset)
+        cal.fit(S, y)
+        self.calibrator_ = cal
+        return self
+
+
+    def rules_table(self) -> pd.DataFrame:
+        return self.rules_df_points.copy()
+
+sc = Scorecard.from_model(
+    clf,
+    X_train, y_train,
+    feature_names=getattr(clf, "feature_names_in_", X_train.columns),
+    min_support=0.05,
+    PDO=20, score0=0,
+    lr_by_stage=1.0,
+    bounds_col='bounds',
+    on_missing='ignore',
+    return_sparse=True
+)
+
+sc.fit_calibrator(X_train, y_train, method='isotonic', n_splits=5)
+
+S_test = sc.predict_scores(X_test)
+proba_test = sc.predict_proba(X_test)
+yhat_test = sc.predict(X_test, 0.5)
+
+print("CR - ISOTONIC - SCORECARD")
+print(classification_report(y_test, yhat_test, digits=2))
+print("\nCR - ORIGINAL MODEL")
+print(classification_report(y_test, clf.predict(X_test), digits=2))
+
+# ============= GRIDSEARCH: BEST SCORECARD PARAMETERS =============
+def _proba_from_clf(clf, X) -> np.ndarray:
+    if hasattr(clf, "predict_proba"):
+        p = clf.predict_proba(X)
+        if p.shape[1] == 2:
+            return p[:,1]
+        raise ValueError("Questo codice assume binario (2 classi).")
+    elif hasattr(clf, "decision_function"):
+        z = clf.decision_function(X).astype(float)
+        return 1.0/(1.0+np.exp(-z))
     else:
-        Xtr, Xte = X[tr_idx], X[te_idx]
-    ytr, yte = y[tr_idx], y[te_idx]
-    return Xtr, Xte, ytr, yte
+        return clf.predict(X).astype(float)
 
-def _compute_metrics(y_true, proba, pred):
-    if np.unique(y_true).size < 2:
-        return None
-    return dict(
-        auc=roc_auc_score(y_true, proba),
-        f1=f1_score(y_true, pred, zero_division=0),
-        balanced_accuracy=balanced_accuracy_score(y_true, pred),
-        mcc=matthews_corrcoef(y_true, pred),
-        accuracy=accuracy_score(y_true, pred),
+def prune_rules(sc: "Scorecard", max_rules: Optional[int]) -> "Scorecard":
+    if not max_rules or max_rules is None:
+        return sc
+    df = sc.rules_df_points.copy()
+    if len(df) <= max_rules:
+        return sc
+    score = df["points"].abs() * (df["support"].clip(lower=1))
+    keep_idx = score.nlargest(int(max_rules)).index
+    pruned = df.loc[keep_idx].sort_index().reset_index(drop=True)
+    sc.rules_df_points = pruned
+    return sc
+
+def evaluate_scorecard(sc: "Scorecard",
+                       clf,
+                       X_eval: pd.DataFrame,
+                       y_eval: np.ndarray,
+                       threshold: float = 0.5) -> Dict[str, float]:
+
+    proba_sc = sc.predict_proba(X_eval)[:,1]
+    yhat_sc = (proba_sc >= threshold).astype(int)
+
+    proba_clf = _proba_from_clf(clf, X_eval)
+    yhat_clf = (proba_clf >= 0.5).astype(int)
+
+    # Classification metrics
+    acc   = accuracy_score(y_eval, yhat_sc)
+    prec  = precision_score(y_eval, yhat_sc, average="binary", zero_division=0)
+    rec   = recall_score(y_eval, yhat_sc, average="binary", zero_division=0)
+    f1    = f1_score(y_eval, yhat_sc, average="binary", zero_division=0)
+    try:
+        auc = roc_auc_score(y_eval, proba_sc)
+    except ValueError:
+        auc = np.nan
+
+    # Loss
+    ll    = log_loss(y_eval, np.c_[1-proba_sc, proba_sc], labels=[0,1])
+    brier = brier_score_loss(y_eval, proba_sc)
+
+    # Fidelity
+    fidelity_label = (yhat_sc == yhat_clf).mean()
+
+    rmse = np.sqrt(np.mean((proba_sc - proba_clf)**2))
+    fidelity_proba = 1.0 - float(rmse)
+
+    # Complexity
+    complexity = int(len(sc.rules_df_points))
+
+    cls_metrics = [acc, prec, rec, f1]
+    if not np.isnan(auc):
+        cls_metrics.append(auc)
+    classification_sum = float(np.sum(cls_metrics))
+
+    return {
+        "acc": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "auc": auc,
+        "classification_sum": classification_sum,
+        "logloss": ll,
+        "brier": brier,
+        "fidelity_label": fidelity_label,
+        "fidelity_proba": fidelity_proba,
+        "complexity": complexity
+    }
+
+def composite_objective(m: Dict[str, float],
+                        weights: Dict[str, float] = None) -> float:
+    if weights is None:
+        weights = dict(
+            classification_sum = 0.40,
+            logloss_score      = 0.18,
+            brier_score        = 0.18,
+            fidelity           = 0.18,
+            complexity_score   = 0.06
+        )
+
+    cls_norm = m["classification_sum"] / 5.0
+
+    ll_score = 1.0 / (1.0 + m["logloss"])
+    br_score = 1.0 / (1.0 + m["brier"])
+
+    fid = 0.5 * m["fidelity_label"] + 0.5 * m["fidelity_proba"]
+
+    cx = 1.0 / (1.0 + float(m["complexity"]))
+
+    return (
+        weights["classification_sum"] * cls_norm +
+        weights["logloss_score"]      * ll_score +
+        weights["brier_score"]        * br_score +
+        weights["fidelity"]           * fid +
+        weights["complexity_score"]   * cx
     )
 
-def eval_dataset_metrics_mean_multi(
-    X, y, model_params: Dict[str, dict],
-    cv_splits: int = 5, seed: int = 123,
-    pairs: Optional[List[Tuple[str, str]]] = None,
-) -> Dict[str, float]:
-    """
-    Returns a dict with (for each metric m and model k):
-      m_{k}  + times train_time_{k}_s  + (opt.) delta_{m}_{B}_minus_{A}
-    and optional speed_{B}_vs_{A} = time_A / time_B ( >1 => B faster than A ).
-    """
-    X_in = X
-    y_np = _ensure_binary_numpy_y(y)
-    skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
-
-    model_names = list(model_params.keys())
-    folds = {name: {m: [] for m in METRICS} for name in model_names}
-    times = {name: 0.0 for name in model_names}
-
-    for tr, te in tqdm(skf.split(X_in if not hasattr(X_in, "values") else X_in.values, y_np)):
-        Xtr, Xte, ytr, yte = _split_index(X_in, y_np, tr, te)
-        if np.unique(yte).size < 2:
+def pareto_front(df: pd.DataFrame) -> np.ndarray:
+    objs = np.column_stack([
+        df["classification_sum"].to_numpy(),
+        1.0 / (1.0 + df["logloss"].to_numpy()),
+        1.0 / (1.0 + df["brier"].to_numpy()),
+        0.5*df["fidelity_label"].to_numpy() + 0.5*df["fidelity_proba"].to_numpy(),
+        1.0 / (1.0 + df["complexity"].to_numpy())
+    ])
+    n = len(df)
+    is_dominated = np.zeros(n, dtype=bool)
+    for i in range(n):
+        if is_dominated[i]:
             continue
+        better_or_equal = (objs >= objs[i]).all(axis=1)
+        strictly_better = (objs >  objs[i]).any(axis=1)
+        dominated_by_j = better_or_equal & strictly_better
+        if dominated_by_j.any():
+            is_dominated[i] = True
+    return np.where(~is_dominated)[0]
 
-        for name in model_names:
-            clf = Model2D(**model_params[name])
-            t0 = time.perf_counter()
-            clf.fit(Xtr, ytr)
-            times[name] += time.perf_counter() - t0
-            proba = clf.predict_proba(Xte)[:, 1]
-            pred = clf.predict(Xte)
-            res = _compute_metrics(yte, proba, pred)
-            if res is None:
-                continue
-            for m in METRICS:
-                folds[name][m].append(res[m])
+def run_scorecard_search(grid: Dict[str, List[Any]],
+                         clf,
+                         X_train: pd.DataFrame, y_train: np.ndarray,
+                         X_eval: pd.DataFrame,  y_eval: np.ndarray,
+                         feature_names=None,
+                         weights: Dict[str, float] = None,
+                         threshold: float = 0.5,
+                         random_state: int = 42) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    records = []
+    combos = list(product(
+        grid.get("min_support", [0.05]),
+        grid.get("PDO", [50]),
+        grid.get("max_rules", [None]),
+        grid.get("calibrator", ["isotonic"])
+    ))
+    for (min_support, PDO, max_rules, calibrator) in tqdm(combos, desc="Grid Search"):
 
-    if any(len(folds[model_names[0]][m]) == 0 for m in METRICS):
-        raise RuntimeError("CV degenerata: nessun fold valido per una o più metriche.")
+        sc = Scorecard.from_model(
+            clf,
+            X_train, y_train,
+            feature_names=(feature_names if feature_names is not None
+                           else getattr(clf, "feature_names_in_", X_train.columns)),
+            min_support=min_support,
+            PDO=PDO,
+            score0=50.0,
+            lr_by_stage=1.0,
+            bounds_col='bounds',
+            on_missing='ignore',
+            return_sparse=True
+        )
+        sc = prune_rules(sc, max_rules=max_rules)
 
-    out = {}
-    for name in model_names:
-        for m in METRICS:
-            out[f"{m}_{name}"] = float(np.mean(folds[name][m]))
-        out[f"train_time_{name}_s"] = float(times[name])
+        sc.fit_calibrator(X_train, y_train, method=calibrator, n_splits=5, random_state=random_state)
 
-    if pairs:
-        for B, A in pairs:
-            for m in METRICS:
-                out[f"delta_{m}_{B}_minus_{A}"] = out[f"{m}_{B}"] - out[f"{m}_{A}"]
-            tA, tB = out[f"train_time_{A}_s"], out[f"train_time_{B}_s"]
-            out[f"speed_{B}_vs_{A}"] = (tA / tB) if tB > 0 else np.nan
+        met = evaluate_scorecard(sc, clf, X_eval, y_eval, threshold=threshold)
 
-    return out
+        J = composite_objective(met, weights=weights)
 
-import traceback
-def run_wilcoxon_over_datasets_multi3(
-    datasets: List[Dict[str, object]],
-    model_params: Dict[str, dict],
-    cv_splits: int = 5,
-    seed: int = 123,
-    pairs: Optional[List[Tuple[str, str]]] = None,
-):
-    rows = []
-    model_names = list(model_params.keys())
+        rec = {
+            "min_support": min_support,
+            "PDO": PDO,
+            "max_rules": max_rules,
+            "calibrator": calibrator,
+            **met,
+            "objective": J,
+            "n_rules": met["complexity"]
+        }
 
-    for ds in datasets:
-        print(f"\n=========== Dataset: {ds['name']} ===========")
-        name, X, Y = ds["name"], ds["X"], ds["y"]
-        try:
-            r = eval_dataset_metrics_mean_multi(
-                X, Y, model_params=model_params,
-                cv_splits=cv_splits, seed=seed, pairs=pairs
-            )
-            rows.append({"dataset": name, **r})
-        except Exception as e:
-            print(f"\n[ERRORE su dataset '{name}'] {type(e).__name__}: {e}")
-            traceback.print_exc()
+        if getattr(sc, "calibrator_", None) is not None and getattr(sc.calibrator_, "metrics_", None):
+            rec.update({
+                "calib_auc_oof":   sc.calibrator_.metrics_.get("auc_oof", np.nan),
+                "calib_brier_oof": sc.calibrator_.metrics_.get("brier_oof", np.nan),
+                "calib_logloss_oof": sc.calibrator_.metrics_.get("logloss_oof", np.nan),
+            })
 
-            nan_row = {"dataset": name}
-            for k in model_names:
-                for m in METRICS:
-                    nan_row[f"{m}_{k}"] = np.nan
-                nan_row[f"train_time_{k}_s"] = np.nan
-            if pairs:
-                for B, A in pairs:
-                    for m in METRICS:
-                        nan_row[f"delta_{m}_{B}_minus_{A}"] = np.nan
-                    nan_row[f"speed_{B}_vs_{A}"] = np.nan
-            nan_row["note"] = f"{type(e).__name__}: {e}"
-            rows.append(nan_row)
+        records.append(rec)
 
-    df = pd.DataFrame(rows)
+    results = pd.DataFrame(records).sort_values("objective", ascending=False).reset_index(drop=True)
 
-    show_cols = ["dataset"]
-    for m in METRICS:
-        show_cols += [f"{m}_{k}" for k in model_names]
-    if pairs:
-        for B, A in pairs:
-            show_cols += [f"delta_{m}_{B}_minus_{A}" for m in METRICS]
-    time_cols = [f"train_time_{k}_s" for k in model_names]
-    speed_cols = [f"speed_{B}_vs_{A}" for (B, A) in (pairs or [])]
+    pf_idx = pareto_front(results)
+    results["pareto"] = False
+    results.loc[pf_idx, "pareto"] = True
 
-    print("\nRAW RESULTS (first columns):")
-    print(df[show_cols + time_cols + speed_cols]
-          .fillna("").to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    best = results.iloc[0].to_dict()
+    return results, best
 
-    stats = {m: {} for m in METRICS}
-    if pairs:
-        for m in METRICS:
-            for (B, A) in pairs:
-                colB, colA = f"{m}_{B}", f"{m}_{A}"
-                ok = df.dropna(subset=[colB, colA]).copy()
-                if ok.shape[0] < 2:
-                    print(f"\n[WARNING] Not enough datasets for Wilcoxon on {m} ({B} vs {A}).")
-                    continue
-                stat_g, p_g = wilcoxon(ok[colB], ok[colA], zero_method="pratt", alternative="greater")
-                stat_2, p_2 = wilcoxon(ok[colB], ok[colA], zero_method="pratt", alternative="two-sided")
-
-                deltas = ok[colB].to_numpy() - ok[colA].to_numpy()
-                wins = int(np.sum(deltas > 0))
-                ties = int(np.sum(deltas == 0))
-                losses = int(np.sum(deltas < 0))
-                psup = (wins + 0.5 * ties) / deltas.size
-                median_delta = float(np.median(deltas))
-                mean_delta = float(np.mean(deltas))
-
-                print(f"\n=== WILCOXON su {m.upper()}  ({B} > {A})  n={ok.shape[0]} ===")
-                print(f"One-sided: p = {p_g:.6g}  (W = {stat_g:.3f})")
-                print(f"Two-sided: p = {p_2:.6g}")
-                print(f"V/P/S: {wins}/{ties}/{losses} | psup ≈ {psup:.3f} | Δ{m} medio={mean_delta:.4f}, mediano={median_delta:.4f}")
-
-                stats[m][(B, A)] = dict(
-                    n=int(ok.shape[0]), W=float(stat_g),
-                    p_one_sided=float(p_g), p_two_sided=float(p_2),
-                    wins=wins, ties=ties, losses=losses,
-                    psup=float(psup), delta_mean=mean_delta, delta_median=median_delta
-                )
-
-    return df, stats
-
-df_all, stats_all = run_wilcoxon_over_datasets_multi3(
-    datasets,
-    model_params=MODEL_PARAMS,
-    cv_splits=3, seed=123,
-    pairs=PAIRS
-) # circa 23 minuti
-print("\nGLOBAL STATISTICS:")
-for m, d in stats_all.items():
-    for (B, A), s in d.items():
-        print(f"{m} | {B} vs {A} -> {s}")
-
-df_global_stats = pd.DataFrame.from_records(
-    [
-        {"metric": m, "model": B, "vs": A, **s}
-        for m, d in stats_all.items()
-        for (B, A), s in d.items()
-    ]
-)
-df_global_stats.to_csv("05_global_stats.csv", index=False)
-
-BASE_PARAMS_STATIC = dict(**BASE_PARAMS)
-BASE_PARAMS_STATIC.update(
-    selection="static",
-    feature_importance_fn=get_feature_importance,
-)
-
-PARAMS_UNIVARIATE_STATIC = dict(**BASE_PARAMS_STATIC, group_mode="univariate")
-PARAMS_PAIRWISE_STATIC   = dict(**BASE_PARAMS_STATIC, group_mode="pairwise",
-                                allow_pair_reuse=False)
-PARAMS_MIXED_STATIC      = dict(**BASE_PARAMS_STATIC, group_mode="mixed",
-                                allow_pair_reuse=False, block_univariate_if_in_pair=True)
-
-MODEL_PARAMS_STATIC = {
-    "univariate": PARAMS_UNIVARIATE_STATIC,
-    "pairwise":   PARAMS_PAIRWISE_STATIC,
-    "mixed":      PARAMS_MIXED_STATIC,
+grid = {
+    "min_support": [0.005, 0.01, 0.05, 0.1, 10, 50],
+    "PDO":         [10, 20, 30, 50, 100],
+    "max_rules":   [None, 50, 100],
+    "calibrator":  ["platt", "isotonic"],
 }
 
-print("\n\n########### RUN: selection=static ###########")
-df_all_static, stats_all_static = run_wilcoxon_over_datasets_multi3(
-    datasets,
-    model_params=MODEL_PARAMS_STATIC,
-    cv_splits=3, seed=123,
-    pairs=PAIRS
-) # circa 15 minuti
-df_global_stats_static = pd.DataFrame.from_records(
-    [
-        {"metric": m, "model": B, "vs": A, **s}
-        for m, d in stats_all_static.items()
-        for (B, A), s in d.items()
-    ]
+WEIGHTS = dict(
+    classification_sum = 0.30,
+    logloss_score      = 0.20,
+    brier_score        = 0.10,
+    fidelity           = 0.20,
+    complexity_score   = 0.20
 )
-df_global_stats_static.to_csv("05_global_stats_static.csv", index=False)
 
-print("\nGLOBAL STATISTICS (selection=static):")
-for m, d in stats_all_static.items():
-    for (B, A), s in d.items():
-        print(f"{m} | {B} vs {A} -> {s}")
+best_config_dataset = pd.read_csv("05_1_best_configurations.csv")
 
-try:
-    df_join = df_all_static.merge(df_all, on="dataset", suffixes=("_static", "_greedy"))
+best_config_dataset = best_config_dataset.rename(columns={"Unnamed: 0": "dataset"})
+best_configs = {row["dataset"]: row["best_params"] for _, row in best_config_dataset.iterrows()}
 
-    for m in METRICS:
-        for k in MODEL_PARAMS_STATIC.keys():
-            df_join[f"delta_{m}_{k}_static_minus_greedy"] = (
-                df_join[f"{m}_{k}_static"] - df_join[f"{m}_{k}_greedy"]
-            )
+results = {}
+for name, info in get_available_datasets().items():
 
-    cols = ["dataset"]
-    for k in MODEL_PARAMS_STATIC.keys():
-        cols += [f"auc_{k}_static", f"auc_{k}_greedy", f"delta_auc_{k}_static_minus_greedy"]
-    print("\nCONFRONTO STATIC vs GREEDY (AUC):")
-    print(df_join[cols].to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    data = load_preprocess(name)
+    X, y = data["X"], data["y"]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
+    )
 
-except NameError:
-    pass
+    if name in best_configs:
+        params = ast.literal_eval(best_configs[name])
+    else:
+        params = {"max_depth": 3, "lr": 1.0, "group_mode": "mixed", "selection": "greedy"}
 
-def save_markdown(df: pd.DataFrame, stats: Dict, filename: str):
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write("# Risultati Esperimenti\n\n")
+    clf = Model2D(
+        max_depth=params["max_depth"],
+        lr=params["lr"],
+        group_mode=params["group_mode"],
+        selection=params["selection"],
+        early_stopping=True,
+        early_stopping_metric="auc",
+        feature_importance_fn=get_feature_importance,
+        verbose=1
+    )
+    clf.fit(X_train, y_train)
 
-        f.write("## Risultati grezzi\n\n")
-        f.write(df.to_markdown(index=False, floatfmt=".4f"))
-        f.write("\n\n")
+    results_df, best_cfg = run_scorecard_search(
+        grid, clf, X_train, y_train, X_test, y_test,
+        feature_names=getattr(clf, "feature_names_in_", X_train.columns),
+        weights=WEIGHTS, threshold=0.5, random_state=42
+    )
+    print(f"Dataset: {name}, Best scorecard config:", best_cfg)
+    results[name] = best_cfg
 
-        f.write("## Statistiche Wilcoxon\n\n")
-        for m, d in stats.items():
-            f.write(f"### Metrica: {m}\n\n")
-            for (B, A), s in d.items():
-                f.write(f"- **{B} vs {A}**  (n={s['n']})\n")
-                f.write(f"  - p (one-sided) = {s['p_one_sided']:.6g}\n")
-                f.write(f"  - p (two-sided) = {s['p_two_sided']:.6g}\n")
-                f.write(f"  - W = {s['W']:.3f}\n")
-                f.write(f"  - Vittorie/Tie/Sconfitte = {s['wins']}/{s['ties']}/{s['losses']}\n")
-                f.write(f"  - psup ≈ {s['psup']:.3f}\n")
-                f.write(f"  - Δ medio = {s['delta_mean']:.4f}, Δ mediano = {s['delta_median']:.4f}\n\n")
+results_df = pd.DataFrame(results).T
+results_df.to_csv("06_scorecard_best_configurations.csv", index=True)
 
-save_markdown(df_all, stats_all, "05_results_greedy.md")
-save_markdown(df_all_static, stats_all_static, "05_results_static.md")
-if "df_join" in locals():
-    with open("05_confronto_static_vs_greedy.md", "w", encoding="utf-8") as f:
-        f.write("# Confronto Static vs Greedy\n\n")
-        cols = ["dataset"]
-        for k in MODEL_PARAMS_STATIC.keys():
-            cols += [f"auc_{k}_static", f"auc_{k}_greedy", f"delta_auc_{k}_static_minus_greedy"]
-        f.write(df_join[cols].to_markdown(index=False, floatfmt=".4f"))
+
+params_df = pd.read_csv("06_scorecard_best_configurations.csv")
+params_df = params_df[['min_support', 'PDO', 'max_rules', 'calibrator']].copy()
+params_df['max_rules'] = params_df['max_rules'].astype(object).fillna("None")
+
+combo_counts = params_df.value_counts()
+
+print("Top params combinations:")
+print(combo_counts.head(5))
+
+param_freq = {col: params_df[col].value_counts() for col in params_df.columns}
+
+print("\nFrequencies for single parameter:")
+for k, freq in param_freq.items():
+    print(f"\n{k}:")
+    print(freq)
+
+full_df = results_df.copy()
+full_df['max_rules'] = full_df['max_rules'].fillna("None")
+
+perf_means = full_df.groupby(['min_support','PDO','max_rules','calibrator'])[
+    ['acc','precision','recall','f1','auc','brier','objective']
+].mean().sort_values('auc', ascending=False)
+perf_means.to_csv("06_scorecard_performance_means.csv")
+
+print("\nMean performance per combination (sort AUC):")
+print(perf_means.head(5))
+
+from sklearn.preprocessing import MinMaxScaler
+
+params_df = perf_means.copy(deep=True).reset_index()
+params_df = params_df[['min_support', 'PDO', 'max_rules', 'calibrator']].copy()
+params_df['max_rules'] = params_df['max_rules'].astype(object).fillna("None")
+
+combo_counts = params_df.value_counts()
+
+param_freq = {col: params_df[col].value_counts() for col in params_df.columns}
+
+
+full_df = results_df.copy()
+full_df['max_rules'] = full_df['max_rules'].fillna("None")
+
+perf_means = full_df.groupby(['min_support','PDO','max_rules','calibrator'])[
+    ['acc','precision','recall','f1','auc','brier','objective']
+].mean()
+
+perf_means['brier'] = -perf_means['brier']
+
+scaler = MinMaxScaler()
+perf_norm = pd.DataFrame(
+    scaler.fit_transform(perf_means),
+    index=perf_means.index,
+    columns=perf_means.columns
+)
+
+perf_norm['perf_score'] = perf_norm.mean(axis=1)
+
+combo_freq = combo_counts / combo_counts.max()
+combo_freq = combo_freq.reindex(perf_norm.index, fill_value=0)
+
+final_score = 0.5 * combo_freq + 0.5 * perf_norm['perf_score']
+final_score = final_score.sort_values(ascending=False)
+
+print("Best default combination:")
+best_combo = final_score.index[0]
+print(best_combo)
+print(f"Final score: {final_score.iloc[0]:.3f}")
+
+ranking = final_score.reset_index()
+ranking.columns = ['min_support','PDO','max_rules','calibrator','final_score']
+ranking.to_csv("06_scorecard_best_default_ranking.csv", index=False)
+print(ranking.head(10))
