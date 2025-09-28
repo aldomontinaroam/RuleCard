@@ -30,6 +30,7 @@ from scipy.special import expit
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import logging
+import matplotlib.pyplot as plt
 
 import numpy as np
 from itertools import product

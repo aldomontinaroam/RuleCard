@@ -262,7 +262,6 @@ class Scorecard:
                    PDO: int = 50,
                    score0: float = 0.0,
                    odds0: Optional[float] = None,
-                   lr_by_stage: Optional[Union[float, Dict[int, float]]] = 1.0,
                    bounds_col: str = 'bounds',
                    on_missing: str = 'ignore',
                    return_sparse: bool = True
@@ -283,8 +282,7 @@ class Scorecard:
             odds0 = p0/(1-p0)
 
         rules_df_points, factor, offset, base_points = cls.weights_to_points(
-            rules_df, PDO=PDO, score0=score0, odds0=odds0,
-            lr_by_stage=lr_by_stage, base_log_odds=base_log_odds
+            rules_df, PDO=PDO, score0=score0, odds0=odds0, base_log_odds=base_log_odds
         )
 
         sc = cls(

@@ -1,0 +1,11 @@
+metric,value
+datasets,12
+CCI_rulecard_mean,0.5324964614255442
+CCI_rulecard_std,0.1502662668430696
+winrate_vs_median,0.75
+winrate_vs_p75,0.5833333333333334
+winrate_vs_max,0.4166666666666667
+weights,"(0.5, 0.2, 0.3)"
+perf_metric,AUC (%)
+time_metric,Time Training (s)
+control,RULECARD

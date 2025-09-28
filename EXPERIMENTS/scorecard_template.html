@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <title>{{TITLE}}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{--bg:#0b0d12;--panel:#11161d;--ink:#e9eef6;--muted:#9eb0c7;--accent:#60a5fa;--border:#263043}
+    *{box-sizing:border-box} html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Helvetica Neue",Arial,"Noto Sans","Liberation Sans",sans-serif}
+    .container{max-width:1100px;margin:24px auto;padding:0 16px}
+    h1{margin:0 0 12px;font-size:22px}
+    .tabs{display:flex;gap:8px;margin:12px 0 16px}
+    .tab-btn{padding:8px 14px;border:1px solid var(--border);background:var(--panel);color:var(--ink);border-radius:10px;cursor:pointer;font-weight:600}
+    .tab-btn.active{outline:2px solid var(--accent)}
+    .panel{display:none;border:1px solid var(--border);border-radius:12px;padding:12px;background:linear-gradient(180deg,#101720,#0e141c)}
+    .panel.active{display:block}
+    .section-title{margin:12px 0 6px;font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+    .toolbar{display:flex;gap:8px;align-items:center;margin:6px 0 10px}
+    input[type=search]{flex:1;min-width:200px;padding:8px 10px;border-radius:10px;border:1px solid var(--border);background:#0d131b;color:var(--ink)}
+    button.small{padding:6px 10px;border-radius:10px;border:1px solid var(--border);background:#0f1620;color:var(--ink);cursor:pointer}
+    .grid{width:100%;border-collapse:collapse}
+    .grid thead th{font-size:13px;text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);color:var(--muted)}
+    .grid tbody td{padding:10px 12px;border-bottom:1px dashed #1f2a3c;vertical-align:top}
+    .grid tr:hover{background:rgba(96,165,250,.08)}
+    .score{text-align:right;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-variant-numeric:tabular-nums;border-radius:8px;padding:2px 6px;display:inline-block;min-width:56px}
+    .legend{display:flex;gap:8px;align-items:center;margin:8px 0 16px}
+    .swatch{width:100px;height:10px;background:linear-gradient(90deg,#b91c1c,#f59e0b,#10b981);border-radius:6px;border:1px solid #1f2a3c}
+    .note{color:var(--muted);font-size:13px}
+    .card{border:1px solid var(--border);border-radius:12px;padding:10px;background:#0f1620;margin-bottom:12px}
+    .card h3{margin:0 0 6px;font-size:15px}
+    .kv{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:13px}
+    .kv div{background:#0c121a;padding:6px 8px;border-radius:8px;border:1px solid #182130}
+    .hide{display:none}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>{{TITLE}}</h1>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="global">GLOBAL</button>
+    <button class="tab-btn" data-tab="local" id="tab-local">LOCAL</button>
+  </div>
+
+  <!-- Pannello GLOBAL -->
+  <div id="global" class="panel active">
+    <div class="section-title">Univariate rules</div>
+    <div class="toolbar">
+      <input id="g_uni_q" type="search" placeholder="Cerca…" />
+      <button class="small" id="g_uni_sort">Ordina per punteggio</button>
+      <span class="legend"><span class="swatch"></span><span class="note">Rosso = negativo, giallo = neutro, verde = positivo</span></span>
+    </div>
+    <table class="grid" id="g_uni_tbl"><thead><tr><th>Bin</th><th style="text-align:right">Score</th></tr></thead><tbody></tbody></table>
+
+    <div id="g_pair_block" class="hide">
+      <div class="section-title">Pairwise rules</div>
+      <div class="toolbar">
+        <input id="g_pair_q" type="search" placeholder="Cerca…" />
+        <button class="small" id="g_pair_sort">Ordina per punteggio</button>
+      </div>
+      <table class="grid" id="g_pair_tbl"><thead><tr><th>Bin</th><th style="text-align:right">Score</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <!-- Pannello LOCAL -->
+  <div id="local" class="panel">
+    <div class="card" id="local-summary-card">
+      <h3>Riepilogo</h3>
+      <div class="kv" id="local-kv"></div>
+    </div>
+
+    <div class="section-title">Univariate rules</div>
+    <div class="toolbar">
+      <input id="l_uni_q" type="search" placeholder="Cerca…" />
+      <button class="small" id="l_uni_sort">Ordina per punteggio</button>
+      <span class="legend"><span class="swatch"></span><span class="note">Rosso = negativo, giallo = neutro, verde = positivo</span></span>
+    </div>
+    <table class="grid" id="l_uni_tbl"><thead><tr><th>Bin</th><th style="text-align:right">Score</th></tr></thead><tbody></tbody></table>
+
+    <div id="l_pair_block" class="hide">
+      <div class="section-title">Pairwise rules</div>
+      <div class="toolbar">
+        <input id="l_pair_q" type="search" placeholder="Cerca…" />
+        <button class="small" id="l_pair_sort">Ordina per punteggio</button>
+      </div>
+      <table class="grid" id="l_pair_tbl"><thead><tr><th>Bin</th><th style="text-align:right">Score</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+</div>
+
+<!-- Dati (placeholder rimpiazzati dal metodo Python) -->
+<script type="application/json" id="data-global">{{DATA_GLOBAL_JSON}}</script>
+<script type="application/json" id="data-local">{{DATA_LOCAL_JSON}}</script>
+<script type="application/json" id="local-summary">{{LOCAL_SUMMARY_JSON}}</script>
+<script>window.HAS_LOCAL = "{{HAS_LOCAL}}" === "true" || "{{HAS_LOCAL}}" === "True";</script>
+
+<script>
+// ---- util colore e render tabelle ----
+function colorFor(v, vmin, vmax){
+  if (vmin===null||vmax===null) return null;
+  const a = Math.max(Math.abs(vmin), Math.abs(vmax)) || 1;
+  const t = (v/(2*a)) + 0.5;
+  const hue = 120*t, sat = 85, light = 45 + 10*(0.5 - Math.abs(t-0.5));
+  return `hsl(${hue.toFixed(1)} ${sat}% ${light.toFixed(1)}%)`;
+}
+function minMax(arr){ if(!arr.length) return [null,null]; let mn=Infinity,mx=-Infinity; for(const x of arr){ if(x<mn) mn=x; if(x>mx) mx=x; } if(mn>0) mn=0; if(mx<0) mx=0; return [mn,mx]; }
+function renderTable(tbody, rows, sortDesc=false, query=""){
+  tbody.innerHTML=""; let filtered = rows;
+  if(query){ const q=query.toLowerCase(); filtered = rows.filter(r=>r.label.toLowerCase().includes(q)); }
+  if(sortDesc){ filtered = filtered.slice().sort((a,b)=> b.pts - a.pts || a.label.localeCompare(b.label)); }
+  const [mn,mx] = minMax(filtered.map(r=>r.pts));
+  for(const r of filtered){
+    const tr=document.createElement("tr");
+    const tdL=document.createElement("td"); tdL.textContent=r.label;
+    const tdS=document.createElement("td"); tdS.className="score"; tdS.textContent=r.score;
+    const clr=colorFor(r.pts,mn,mx); if(clr){ tdS.style.background=clr; tdS.style.color="#0b0d12"; }
+    tr.appendChild(tdL); tr.appendChild(tdS); tbody.appendChild(tr);
+  }
+}
+
+// ---- carica JSON embedded ----
+const DATA_GLOBAL = JSON.parse(document.getElementById("data-global").textContent);
+const DATA_LOCAL  = JSON.parse(document.getElementById("data-local").textContent);
+const LOCAL_SUMMARY = JSON.parse(document.getElementById("local-summary").textContent);
+
+// ---- tab switching ----
+document.querySelectorAll(".tab-btn").forEach(btn=>{
+  btn.addEventListener("click", ()=>{
+    document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(btn.dataset.tab).classList.add("active");
+  });
+});
+
+// ---- init GLOBAL ----
+(() => {
+  const uniBody = document.querySelector("#g_uni_tbl tbody");
+  const pairBody = document.querySelector("#g_pair_tbl tbody");
+  let sortUni=false, sortPair=false;
+  const doRenderUni=()=>renderTable(uniBody, DATA_GLOBAL.uni, sortUni, document.getElementById("g_uni_q").value);
+  const doRenderPair=()=>renderTable(pairBody, DATA_GLOBAL.pair, sortPair, document.getElementById("g_pair_q").value);
+  document.getElementById("g_uni_q").addEventListener("input", doRenderUni);
+  document.getElementById("g_uni_sort").addEventListener("click", ()=>{ sortUni=!sortUni; doRenderUni(); });
+  if (DATA_GLOBAL.pair && DATA_GLOBAL.pair.length) {
+    document.getElementById("g_pair_block").classList.remove("hide");
+    document.getElementById("g_pair_q").addEventListener("input", doRenderPair);
+    document.getElementById("g_pair_sort").addEventListener("click", ()=>{ sortPair=!sortPair; doRenderPair(); });
+  }
+  doRenderUni(); if (DATA_GLOBAL.pair && DATA_GLOBAL.pair.length) doRenderPair();
+})();
+
+// ---- init LOCAL (mostra/nasconde tab/pannello) ----
+(() => {
+  if (!window.HAS_LOCAL || !DATA_LOCAL) {
+    document.getElementById("tab-local").style.display = "none";
+    document.getElementById("local").style.display = "none";
+    return;
+  }
+  const kv = document.getElementById("local-kv");
+  const s = LOCAL_SUMMARY || {};
+  kv.innerHTML = [
+    `<div><strong>CLASS</strong>: ${s.pred_class ?? "-"}</div>`,
+    `<div><strong>Total</strong>: ${s.total_points ? Math.round(s.total_points) : "-"}</div>`,
+    `<div><strong>Base</strong>: ${s.base_points ? Math.round(s.base_points) : "-"}</div>`,
+    `<div><strong>Threshold</strong>: ${s.threshold ? Math.round(s.threshold) : "-"}</div>`,
+    `<div><strong>Decision</strong>: ${s.decision ?? "-"}</div>`,
+    `<div><strong>P(1)</strong>: ${typeof s.proba_p1==='number' ? s.proba_p1.toFixed(3) : "-"}</div>`,
+    `<div><strong>P(0)</strong>: ${typeof s.proba_p0==='number' ? s.proba_p0.toFixed(3) : "-"}</div>`
+  ].join("");
+
+  const uniBody = document.querySelector("#l_uni_tbl tbody");
+  const pairBody = document.querySelector("#l_pair_tbl tbody");
+  let sortUni=false, sortPair=false;
+  const doRenderUni=()=>renderTable(uniBody, DATA_LOCAL.uni, sortUni, document.getElementById("l_uni_q").value);
+  const doRenderPair=()=>renderTable(pairBody, DATA_LOCAL.pair, sortPair, document.getElementById("l_pair_q").value);
+  document.getElementById("l_uni_q").addEventListener("input", doRenderUni);
+  document.getElementById("l_uni_sort").addEventListener("click", ()=>{ sortUni=!sortUni; doRenderUni(); });
+  if (DATA_LOCAL.pair && DATA_LOCAL.pair.length) {
+    document.getElementById("l_pair_block").classList.remove("hide");
+    document.getElementById("l_pair_q").addEventListener("input", doRenderPair);
+    document.getElementById("l_pair_sort").addEventListener("click", ()=>{ sortPair=!sortPair; doRenderPair(); });
+  }
+  doRenderUni(); if (DATA_LOCAL.pair && DATA_LOCAL.pair.length) doRenderPair();
+})();
+</script>
+</body>
+</html>
