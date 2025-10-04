@@ -76,9 +76,9 @@ def run_ebm_lasso(X, Y, X_names, Y_name, dataset_name):
     )
     start_time = time.time()
     model_full = EBC(
-            interactions=0,
-            max_bins=20,
-            n_jobs=-1
+        interactions=0,
+        max_bins=20,
+        n_jobs=-1
     )
     model_full.fit(X_train, y=Y_train)
 
@@ -93,6 +93,11 @@ def run_ebm_lasso(X, Y, X_names, Y_name, dataset_name):
     )
     linear_model.fit(Xtrv_tc, y_trv)
     
+    coefs = linear_model.coef_.ravel()
+    n_features_originali = len(coefs)
+    n_features_usate = np.sum(coefs != 0)
+    sparsity_ratio = 1 - (n_features_usate / n_features_originali)
+
     ebm_reduced = copy.deepcopy(model_full)
     ebm_reduced = rescale_ebm_from_linear_model(ebm_reduced, linear_model, sweep=True)
     time_training = time.time() - start_time
@@ -108,7 +113,10 @@ def run_ebm_lasso(X, Y, X_names, Y_name, dataset_name):
         'X_names': X_names,
         'Y_name': Y_name,
         'dataset_name': dataset_name,
-        'time_training': time_training
+        'time_training': time_training,
+        'sparsity_ratio': sparsity_ratio,
+        'n_features_originali': n_features_originali,
+        'n_features_usate': n_features_usate
     }
 
     return results

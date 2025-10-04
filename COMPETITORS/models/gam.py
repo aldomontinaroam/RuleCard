@@ -231,9 +231,6 @@ def run_gam(
 
     pbar.close()
 
-    # ------------------------------
-    # 4) Return and final refit
-    # ------------------------------
     results_df = pd.DataFrame(results).sort_values(
         by=['val_auc', 'val_f1', 'n_features'], ascending=[False, False, True]
     ).reset_index(drop=True)

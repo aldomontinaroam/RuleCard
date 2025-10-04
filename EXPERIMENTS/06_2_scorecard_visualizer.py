@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Literal
+from matplotlib.text import Text
 
-from __future__ import annotations
+
 
 import numpy as np
 import pandas as pd
@@ -38,6 +41,101 @@ class ScorecardVisualizer:
         base = self._strip_prefix(str(name))
         return self._ohe_lookup.get(base)
 
+    def _score_from_proba(self, p: float) -> float:
+        sc = self.scorecard
+        return float(sc.offset) + float(sc.factor) * np.log(float(p)/(1.0-float(p)))
+
+    def compute_risk_bands(self, *, probs=None, labels=None, colors=None) -> Dict[str, Any]:
+        if probs is None:
+            probs = [0.05, 0.15, 0.35, 0.65]
+        probs = sorted(float(p) for p in probs if 0.0 < p < 1.0)
+
+        cut_scores = [self._score_from_proba(p) for p in probs]
+
+        nbands = len(probs) + 1
+        if labels is None:
+            labels = ["Very Low","Low","Medium","High","Very High"][:nbands]
+        if colors is None:
+            colors = (["#d73027","#fc8d59","#fee08b","#91cf60","#1a9850"]
+                    if nbands==5 else ["#d73027","#fdae61","#a6d96a","#1a9850"][:nbands])
+
+        # limiti “pratici” (evitiamo ±inf)
+        s_min = self._score_from_proba(0.01)
+        s_max = self._score_from_proba(0.99)
+
+        return {
+            "edges_proba": [0.0] + probs + [1.0],
+            "edges_score": [None] + cut_scores + [None],  # nessun ±inf
+            "labels": labels,
+            "colors": colors,
+            "threshold_score": float(self.scorecard.offset),
+            "score_min": float(s_min),
+            "score_max": float(s_max),
+        }
+
+
+
+
+    def _families_from_features(self, feats: Any) -> List[str]:
+        """
+        Restituisce 1 o 2 'famiglie' leggibili per una regola, a partire da features/bounds.
+        - OHE: usa la famiglia (prima della '_' nella mappatura) es. 'marital_status'
+        - Numeriche: usa il nome base es. 'age'
+        - Pairwise: restituisce due famiglie ordinate
+        """
+        fams = []
+        if isinstance(feats, (list, tuple)):
+            for f in feats:
+                base = self._strip_prefix(str(f))
+                fc = self._split_ohe(base)
+                fam = fc[0] if fc else base
+                fams.append(self._clean_identifier(fam))
+        fams = sorted(list({f for f in fams if f}))
+        return fams[:2] if fams else ["Other"]
+
+    def compute_factors_share(
+        self, *, top_k: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Calcola la 'torta dei fattori': quota di impatto per famiglia.
+        impact = support * points (assoluto per la somma).
+        Aggrega anche regole pairwise (fam1 & fam2).
+        """
+        df = self.scorecard.rules_df_points.copy()
+        if "support" not in df.columns or "points" not in df.columns:
+            return {"items": [], "total_abs_impact": 0.0}
+
+        def _label_from_row(row) -> str:
+            fams = self._families_from_features(row.get("features", None))
+            return " & ".join(fams) if len(fams) > 1 else fams[0]
+
+        df["__family__"] = df.apply(_label_from_row, axis=1)
+        df["__impact__"] = (df["support"].astype(float) * df["points"].astype(float)).abs()
+
+        byfam = (df.groupby("__family__", as_index=False)
+                .agg(abs_impact=(".__impact__".replace(".", ""), "sum")  # protection if name conflicts
+                        if "__impact__" not in df.columns else ("__impact__", "sum"),
+                        n_rules=("points", "count")))
+        # Quick fix: if previous line is confusing, do a clean aggregate:
+        byfam = (df.groupby("__family__", as_index=False)
+                .agg(abs_impact=("__impact__", "sum"),
+                        n_rules=("points", "count")))
+
+        total = float(byfam["abs_impact"].sum()) or 1.0
+        byfam["share"] = byfam["abs_impact"] / total
+        byfam = byfam.sort_values("share", ascending=False)
+
+        top = byfam.head(top_k).to_dict("records")
+        if len(byfam) > top_k:
+            other_share = float(byfam["share"].iloc[top_k:].sum())
+            other_impact = float(byfam["abs_impact"].iloc[top_k:].sum())
+            top.append({"__family__": "Other", "abs_impact": other_impact, "n_rules": int(byfam["n_rules"].iloc[top_k:].sum()), "share": other_share})
+
+        # schema pulito per il template
+        items = [{"name": r["__family__"], "share": float(r["share"]), "abs_impact": float(r["abs_impact"]), "n_rules": int(r["n_rules"])} for r in top]
+        return {"items": items, "total_abs_impact": float(total)}
+
+
     @staticmethod
     def _expit(x):
         x = np.asarray(x, dtype=float)
@@ -68,12 +166,14 @@ class ScorecardVisualizer:
             base_row_h=0.1,
             row_gap=0.015,
             min_row_inch=0.03, 
-            cell_pad=0.02,
+            cell_pad=0.01,
             col_widths=(0.9, 0.1),
             font_min=9,
             font_max=12,
             max_fig_height=10,
         )
+    
+    
 
     def _inverse_feature_values(self, var: str, values: List[float]) -> List[float]:
         if self.scaler is None:
@@ -427,14 +527,23 @@ class ScorecardVisualizer:
 
 
     def _cond_pretty_all(self, cond: str, vocab: Dict[str, List[str]]) -> str:
-        pat = re.compile(
+        # Pattern per variabili categoriche con valori esatti (0, 1, YES, NO, etc.)
+        pat_exact = re.compile(
             r"(?P<tok>[A-Za-z][A-Za-z0-9_]+)"
             r"\s*(?P<op>:|==|!=)\s*"
             r"(?P<val>0|1|YES|NO|True|False)",
             re.IGNORECASE,
         )
 
-        def repl(m):
+        # Pattern per variabili categoriche con soglie numeriche (> 0.5, <= 0.5, etc.)
+        pat_threshold = re.compile(
+            r"(?P<tok>[A-Za-z][A-Za-z0-9_]+)"
+            r"\s*(?P<op><=|>=|<|>)\s*"
+            r"(?P<val>0\.\d+)",
+            re.IGNORECASE,
+        )
+
+        def repl_exact(m):
             tok = m.group("tok")
             op  = "==" if m.group("op") == ":" else m.group("op")
             val = m.group("val")
@@ -447,8 +556,54 @@ class ScorecardVisualizer:
             fam, cat = fc
             return self._cond_pretty(f"{fam}_{cat} {op} {val}", fam, vocab)
 
-        return pat.sub(repl, cond)
-    
+        def repl_threshold(m):
+            tok = m.group("tok")
+            op = m.group("op")
+            val = float(m.group("val"))
+
+            base = self._strip_prefix(tok)
+            fc = self._split_ohe(base)
+            if not fc:
+                return m.group(0)
+
+            fam, cat = fc
+            cats_obs = vocab.get(fam, [])
+            
+            # Determina se è binaria
+            if self.mapping and fam in self.mapping:
+                cats_map = [self._strip_prefix(c).replace(f"{fam}_", "", 1) for c in self.mapping[fam]]
+                binary_like = (len(set(cats_map)) == 2)
+            else:
+                binary_like = (len(cats_obs) == 2)
+
+            fam_label = self._clean_identifier(fam)
+            cat_label = self._clean_identifier(cat)
+            
+            # Interpreta la soglia
+            # > 0.5 o >= 0.5 significa "è presente" (= 1, = YES)
+            # < 0.5 o <= 0.5 significa "non è presente" (= 0, = NO)
+            if op in (">", ">="):
+                if val < 0.5:
+                    # > 0.1 è sempre vero per valori 0/1, ignora
+                    return m.group(0)
+                # > 0.5 significa "questa categoria è attiva"
+                return f"{fam_label} {cat_label}" if binary_like else f"{fam_label} = {cat_label}"
+            else:  # "<" o "<="
+                if val > 0.5:
+                    # < 0.9 è sempre vero per valori 0/1, ignora
+                    return m.group(0)
+                # <= 0.5 significa "questa categoria NON è attiva"
+                other = self._other_label(fam, cat, cats_obs)
+                if binary_like and other is not None:
+                    return f"{fam_label} {other}"
+                return f"{fam_label} ≠ {cat_label}"
+
+        # Prima applica il pattern per valori esatti
+        result = pat_exact.sub(repl_exact, cond)
+        # Poi applica il pattern per soglie numeriche
+        result = pat_threshold.sub(repl_threshold, result)
+        
+        return result
     @staticmethod
     def _merge_active_bins(bins):
         if not bins:
@@ -721,18 +876,16 @@ class ScorecardVisualizer:
         sort_bins_by: str = "points_desc",
         title: str = "Scorecard",
         template_path: str = "scorecard_template.html",
-        savepath: str = "scorecard.html"
+        savepath: str = "scorecard.html",
+        # --- NUOVI opzionali ---
+        band_probs: Optional[List[float]] = None,
+        band_labels: Optional[List[str]] = None,
+        topk_factors: int = 5
     ) -> str:
-        """
-        {{TITLE}}
-        {{HAS_LOCAL}} -> true | false
-        {{DATA_GLOBAL_JSON}} -> JSON (univariate/pairwise global)
-        {{DATA_LOCAL_JSON}} -> JSON o null
-        {{LOCAL_SUMMARY_JSON}} -> JSON o null
-        """
         import json, html, os
         from pathlib import Path
         import pandas as pd
+
 
         df_global = self.global_table()
         (g_uni_rows, g_uni_pts), (g_pair_rows, g_pair_pts) = self._build_scorecard_table_data(
@@ -791,6 +944,10 @@ class ScorecardVisualizer:
                 "proba_p0": float(proba[0]),
             }
 
+
+        risk_bands = self.compute_risk_bands(probs=band_probs, labels=band_labels)
+        factors = self.compute_factors_share(top_k=topk_factors)
+
         tpath = Path(template_path)
         if not tpath.exists():
             base = Path(os.path.dirname(__file__)) if "__file__" in globals() else Path.cwd()
@@ -808,6 +965,9 @@ class ScorecardVisualizer:
             "{{DATA_GLOBAL_JSON}}": json.dumps(data_global, ensure_ascii=False),
             "{{DATA_LOCAL_JSON}}": json.dumps(data_local, ensure_ascii=False) if data_local is not None else "null",
             "{{LOCAL_SUMMARY_JSON}}": json.dumps(local_summary, ensure_ascii=False) if local_summary is not None else "null",
+            # --- NUOVE PLACEHOLDER ---
+            "{{RISK_BANDS_JSON}}": json.dumps(risk_bands, ensure_ascii=False),
+            "{{FACTORS_JSON}}": json.dumps(factors, ensure_ascii=False),
         }
 
         for k, v in replacements.items():
@@ -888,31 +1048,33 @@ class ScorecardVisualizer:
             ZWSP = "\u200b"
             pat = re.compile(rf"(\S{{{every}}})(?=\S)")
             return pat.sub(lambda m: m.group(1) + ZWSP, s)
+        
+                
+        def _wrap_by_pixels(text: str, max_w_px: float, fontsize: float, renderer, soft_every: int = 24):
+            ZWSP = "\u200b"
+            pat = re.compile(rf"(\S{{{soft_every}}})(?=\S)")
+            s = pat.sub(lambda m: m.group(1) + ZWSP, str(text))
 
-        def _wrap_rows(rows: List[List[str]]) -> Tuple[List[List[str]], List[int]]:
-            if not rows:
-                return rows, []
-            wrapped = [rows[0][:]]
-            line_counts = [1]
-            for r in rows[1:]:
-                cond, score = r
-                cond = _soft_break_tokens(str(cond))
-                ws = textwrap.fill(
-                    cond,
-                    width=wrap_width,
-                    break_long_words=True,
-                    break_on_hyphens=False
-                )
-                wrapped.append([ws, score])
-                line_counts.append(max(1, ws.count("\n") + 1))
-            return wrapped, line_counts
+            words = s.split()
+            if not words:
+                return [""]
 
+            lines = [words[0]]
+            for w in words[1:]:
+                cand = lines[-1] + " " + w
+                t = Text(0, 0, cand, fontsize=fontsize)
+                t.set_figure(fig)
+                bb = t.get_window_extent(renderer=renderer, dpi=fig.dpi)
+                if bb.width <= max_w_px:
+                    lines[-1] = cand
+                else:
+                    lines.append(w)
+            return lines
 
-        uni_rows, uni_linecounts = _wrap_rows(uni_rows)
-        if pair_rows:
-            pair_rows, pair_linecounts = _wrap_rows(pair_rows)
-        else:
-            pair_linecounts = []
+        
+
+        uni_linecounts  = [1] * max(0, len(uni_rows)  - 1)
+        pair_linecounts = [1] * max(0, (len(pair_rows) - 1) if pair_rows else 0)
 
         uni_units  = 1 + sum(uni_linecounts)
         pair_units = (1 + sum(pair_linecounts)) if pair_rows else 0
@@ -922,10 +1084,17 @@ class ScorecardVisualizer:
         n_rows_grand_total = n_uni + n_pair
 
         margin = 0.6 if title else 0.35
-  
+
+        extra_top = 0.0
+        if annotate_total:
+            TOP_PAD = 0.02   # come nel banner
+            BAR_H   = 0.08
+            GAP     = 0.02   # piccolo gap sotto il banner
+            extra_top = TOP_PAD + BAR_H + GAP
+
         height_theoretical = max(
             min_row_inch * (1 + n_rows_grand_total),
-            base_row_h * total_units_all + margin + (row_gap if pair_rows else 0.0),
+            base_row_h * total_units_all + margin + extra_top + (row_gap if pair_rows else 0.0),
             2.6,
         )
 
@@ -944,7 +1113,9 @@ class ScorecardVisualizer:
         fig, ax = plt.subplots(figsize=(10, height), dpi=dpi)
         ax.axis("off")
         if title:
-            ax.set_title(title, fontsize=10, loc="left", pad=8)
+            ax.set_title(title, fontsize=15, loc="center", pad=10)
+
+        y_cursor = 1.0 - extra_top
 
         def _make_norm_for(pts):
             pts = [float(p) for p in pts if p is not None]
@@ -964,40 +1135,71 @@ class ScorecardVisualizer:
             L = 0.2126 * r + 0.7152 * g + 0.0722 * b
             return "black" if L > 0.5 else "white"
 
-        y_cursor = 1.0
-
         def _compute_fontsize():
             raw = font_max - 0.003 * n_rows_grand_total
             return max(font_min, min(font_max, raw))
 
-        def _add_table(rows, pts_per_row, linecounts, subtitle: Optional[str] = None):
+        def _add_table(rows, pts_per_row, subtitle: Optional[str] = None):
             nonlocal y_cursor
             if not rows:
                 return
-            
+
+            # Assicura il renderer
+            if fig.canvas.get_renderer() is None:
+                fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+
             norm, cmap = _make_norm_for(pts_per_row)
 
             if subtitle:
                 ax.text(0.01, y_cursor, subtitle, fontsize=10, va="top", ha="left")
                 y_cursor -= 0.06
 
-            row_units = [1] + linecounts
-            total_units = sum(row_units)
+            fs_base = _compute_fontsize()
 
+            # --- Calcolo larghezza utile della 1a colonna in pixel ---
+            # dimensioni figura
+            fig_w_in = fig.get_size_inches()[0]
+            fig_w_px = fig_w_in * dpi
+            # bbox dell'axes in figura
+            ax_pos = ax.get_position()
+            axes_w_px = fig_w_px * ax_pos.width
+            # larghezza della tabella (bbox=[0.01, ..., 0.98, ...] -> 0.98 dell'axes)
+            table_w_px = axes_w_px * 0.98
+            # larghezza colonna 0
+            col0_w_px = table_w_px * float(col_widths[0])
+            # piccolo margine interno (padding cella)
+            inner_pad_px = 8.0
+            max_w_px = max(10.0, col0_w_px - inner_pad_px)
+
+            # --- Wrap per pixel: produce righe e linecounts coerenti ---
+            wrapped_rows = [rows[0][:]]  # header invariato
+            linecounts = [1]
+            for cond, score in rows[1:]:
+                lines = _wrap_by_pixels(cond, max_w_px, fs_base, renderer)
+                # opzionale: limita a N righe e aggiungi ellissi
+                MAX_LINES = 3  # cambia se vuoi
+                if len(lines) > MAX_LINES:
+                    lines = lines[:MAX_LINES]
+                    lines[-1] = lines[-1].rstrip() + "…"
+                wrapped_rows.append(["\n".join(lines), score])
+                linecounts.append(max(1, len(lines)))
+
+            # Ora che conosciamo le altezze (linecounts), calcola le unità
+            row_units = [1] + linecounts[1:]  # header + data
+            total_units = sum(row_units)
             table_h = base_row_h_eff * total_units
             col_count = len(rows[0])
 
             table = ax.table(
-                cellText=rows,
+                cellText=wrapped_rows,
                 colWidths=list(col_widths),
                 cellLoc="left",
                 loc="upper left",
                 bbox=[0.01, y_cursor - table_h, 0.98, table_h],
             )
 
-            fs_base = _compute_fontsize()
-
-            for r in range(len(rows)):
+            for r in range(len(wrapped_rows)):
                 units = row_units[r]
                 h = (units / total_units) * table_h
                 for c in range(col_count):
@@ -1006,7 +1208,7 @@ class ScorecardVisualizer:
                     cell.set_linewidth(0.6 if r else 1.0)
 
                     txt = cell.get_text()
-                    txt.set_wrap(True)
+                    txt.set_wrap(False)  # <--- NON lasciare che Matplotlib wrappi di nuovo
                     txt.set_fontsize((fs_base + 1) if r == 0 else fs_base)
 
                     if r == 0:
@@ -1014,6 +1216,8 @@ class ScorecardVisualizer:
                         if c == col_count - 1:
                             txt.set_ha("right")
                     else:
+                        if c == 0:
+                            txt.set_ha("left")
                         score_col_idx = col_count - 1
                         if c == score_col_idx:
                             txt.set_ha("right")
@@ -1027,36 +1231,78 @@ class ScorecardVisualizer:
 
             y_cursor -= (table_h + row_gap)
 
+
         Cell.PAD = cell_pad
 
-        _add_table(uni_rows, uni_pts, uni_linecounts, subtitle="Univariate rules")
+        _add_table(uni_rows, uni_pts, subtitle="Univariate rules")
         if pair_rows:
-            _add_table(pair_rows, pair_pts, pair_linecounts, subtitle="Pairwise rules")
+            _add_table(pair_rows, pair_pts, subtitle="Pairwise rules")
+        
 
         if annotate_total and (total_points is not None):
             pred_class = 1 if total_points >= points_threshold else 0
-            base_val  = float(self.scorecard.base_points)
-            rules_sum = float(total_points - base_val)
-            text_lines = [
-                f"CLASS: {pred_class}",
-                f"Total score: {total_points:.0f}",
-                f"(Base: {base_val:.0f})"
-            ]
-            if points_threshold is not None:
-                comp = ">=" if total_points >= points_threshold else "<"
-                text_lines += [
-                    f"Threshold: {points_threshold:.0f}",
-                    f"Decision: {total_points:.0f} {comp} {points_threshold:.0f}"
-                ]
-            bbox = ax.get_position()
-            fig.text(
-                bbox.x1 - 0.01, bbox.y1 + 0.01, "\n".join(text_lines),
-                ha="right", va="bottom", fontsize=10,
-                bbox=dict(boxstyle="round", alpha=1,
-                          facecolor="paleturquoise", edgecolor="teal"),
-                zorder=10
-            )
+            status_color = "#2ecc71" if pred_class == 1 else "#e74c3c"
 
+            # --- probabilità dal punteggio (p1 = P(classe 1)) ---
+            proba = self._predict_proba_from_score(
+                [total_points], factor=sc.factor, offset=sc.offset
+            )[0]
+            p1 = float(proba[1])            # es. 0.902...
+            pct_txt = f"{int(round(p1*100))}%"
+
+            # --- geometria banner (coerente con extra_top) ---
+            left, right = 0.02, 0.98
+            width = right - left
+            TOP_PAD, BAR_H = 0.02, 0.08
+            bottom = 1 - TOP_PAD - BAR_H
+            center_y = bottom + BAR_H/2
+
+            from matplotlib.patches import Rectangle, FancyBboxPatch
+
+            # sfondo
+            ax.add_patch(FancyBboxPatch(
+                (left, bottom), width, BAR_H,
+                boxstyle="round,pad=0.01",
+                facecolor=status_color, edgecolor=status_color,
+                alpha=0.15, transform=ax.transAxes, zorder=10, clip_on=False
+            ))
+
+            # testi
+            ax.text(left + 0.01*width, center_y,
+                    f"PREDICTION: CLASS {pred_class}",
+                    fontsize=13, weight='bold', color=status_color,
+                    va='center', ha='left', transform=ax.transAxes, zorder=11)
+
+            ax.text(left + 0.35*width, center_y,
+                    f"Score: {int(total_points)} | Threshold: {points_threshold}",
+                    fontsize=11, weight='bold', color='#2c3e50',
+                    va='center', ha='left', transform=ax.transAxes, zorder=11)
+
+            bar_w = 0.18*width
+            bar_x = left + 0.7*width
+            prog_h = 0.35*BAR_H
+            prog_y = center_y - prog_h/2
+
+            ax.add_patch(Rectangle(
+                (bar_x, prog_y), bar_w, prog_h,
+                facecolor='#ecf0f1', edgecolor='#95a5a6', linewidth=1,
+                transform=ax.transAxes, zorder=11
+            ))
+            ax.add_patch(Rectangle(
+                (bar_x, prog_y), bar_w * p1, prog_h,
+                facecolor=status_color, edgecolor='none',
+                transform=ax.transAxes, zorder=12
+            ))
+            ax.text(bar_x + bar_w/2, center_y, pct_txt,
+                    fontsize=8, color='black', weight='bold',
+                    va='center', ha='center', transform=ax.transAxes, zorder=13)
+
+            '''comp = "≥" if total_points >= points_threshold else "<"
+            ax.text(right - 0.02, center_y,
+                    f"{int(total_points)} {comp} {int(points_threshold)}",
+                    fontsize=11, color='#2c3e50', weight='bold',
+                    va='center', ha='right', transform=ax.transAxes, zorder=11)'''
+                    
         if savepath is None:
             savepath = "scorecard_table.png"
         fig.savefig(savepath, bbox_inches="tight")

@@ -88,6 +88,23 @@ def evaluate_figs(model, X_test, Y_test, time_training):
             'Time Testing (s)': None
         }, f"[TIMEOUT (train > {time_training}s)]"
     
+    try:
+        if hasattr(model, 'feature_importances_'):
+            used_features_idx = (model.feature_importances_ > 0)
+            n_features_used = used_features_idx.sum()
+        elif hasattr(model, 'features_'):
+            n_features_used = len(set(model.features_))
+        else:
+            n_features_used = None
+        
+        n_features_originali = X_test.shape[1]
+        sparsity_ratio = None
+        if n_features_used is not None and n_features_originali > 0:
+            sparsity_ratio = 1 - (n_features_used / n_features_originali)
+    except Exception as e:
+        print(f"[WARN] Impossibile calcolare Sparsity Ratio: {e}")
+        sparsity_ratio = None
+
     start_test = time.time()
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
@@ -122,9 +139,10 @@ def evaluate_figs(model, X_test, Y_test, time_training):
         'True Negatives': tn,
         'False Negatives': fn,
         'Time Training (s)': time_training,
-        'Time Testing (s)': time_testing
+        'Time Testing (s)': time_testing,
+        'Sparsity Ratio': sparsity_ratio
     }
 
     report = classification_report(Y_test, y_pred, output_dict=True)
-
+    
     return metrics, report
