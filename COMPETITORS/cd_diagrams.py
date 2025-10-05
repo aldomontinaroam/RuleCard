@@ -8,18 +8,8 @@ Evaluation of multiple classifiers over multiple datasets with:
 REFERENCES:
 - Demsar, J. (2006). Statistical comparisons of classifiers over multiple data sets. JMLR.
 - Iman, R. L., & Davenport, J. M. (1980). Approximations of the critical region of the Friedman statistic. Communications in Statistics.
-- Dunn, O. J. (1961). Multiple comparisons among means. Journal of the American Statistical Association.
 - Holm, S. (1979). A simple sequentially rejective multiple test procedure. Scandinavian Journal of Statistics.
-- Hochberg, Y. (1988). A sharper Bonferroni procedure. Biometrika.
 - García, S., & Herrera, F. (2008). An extension on “Statistical comparisons of classifiers”. Pattern Recognition Letters.
-- Bergmann, B., & Hommel, G. (1988). Improvements of general multiple test procedures. Biometrics.
-
-KEY POINTS:
-- Complete block design (each classifier evaluated on each dataset).
-- Non-parametric tests on ranks: no assumption of normality/homoscedasticity.
-- The CD-plots visualize Nemenyi or Dunn thresholds (a single threshold): stepwise procedures
-  (e.g. Holm) are NOT representable with a single CD line; for this reason, the plots and tables
-  may diverge, this is expected and should be explained.
 """
 
 from __future__ import annotations
@@ -35,7 +25,6 @@ import matplotlib.pyplot as plt
 matplotlib.rcParams["font.family"] = "sans-serif"
 matplotlib.rcParams["font.sans-serif"] = "Arial"
 
-# --- AEON (CD-diagram) --------------------------------------------------------
 try:
     # aeon>=0.7
     from aeon.visualisation import (
@@ -47,7 +36,6 @@ except Exception as e:
         "Cannot import 'aeon'. Install with: pip install aeon"
     ) from e
 
-# --- SciPy --------------------------------------------------------------------
 from scipy.stats import (
     friedmanchisquare,
     f,
@@ -55,9 +43,6 @@ from scipy.stats import (
     norm,
 )
 
-# =============================================================================
-# I/O & PREP
-# =============================================================================
 def _ensure_outdir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -95,7 +80,7 @@ def load_model_csvs(
         if df.index.name is None or str(df.index.name).startswith("Unnamed"):
             df.index.name = "dataset_name"
         df["dataset_name"] = df.index.astype(str)
-        df["classifier_name"] = model.replace("_comparison", "").upper()
+        df["classifier_name"] = model.replace("_all_datasets", "").upper()
         records.append(df.reset_index(drop=True))
 
     if not records:
@@ -179,7 +164,7 @@ def friedman_report(pivot: pd.DataFrame) -> dict:
         return {"test": "wilcoxon", "p": float(p), "k": k, "N": N}
 
     chi2, p_chi2 = friedmanchisquare(*[pivot[c].values for c in cols])
-    Ff = ((N - 1) * chi2) / (N * (k - 1) - chi2)  # Iman–Davenport
+    Ff = ((N - 1) * chi2) / (N * (k - 1) - chi2)  # Iman-Davenport
     p_F = f.sf(Ff, k - 1, (k - 1) * (N - 1))
     print(
         f"[Friedman] chi2={chi2:.3f}, p={p_chi2:.4g} | "
@@ -266,9 +251,6 @@ def posthoc_vs_control(
     ]
 
 
-# =============================================================================
-# CD-DIAGRAM (Nemenyi or Dunn)
-# =============================================================================
 def make_cd_plot(
     df_all: pd.DataFrame,
     metric: str,
@@ -294,32 +276,19 @@ def make_cd_plot(
     scores, labels, pivot = _prepare_scores(df_all, metric)
 
     omnibus = friedman_report(pivot)
-    k = omnibus["k"]
+    k, N = omnibus["k"], omnibus["N"]
 
-    if out_prefix is None:
-        safe_metric = (
-            metric.lower()
-            .replace("%", "perc")
-            .replace("(", "")
-            .replace(")", "")
-            .replace(" ", "_")
-            .replace("/", "_")
-        )
-        out_prefix = f"cd_{safe_metric}"
+    se = np.sqrt(k*(k+1)/(6.0*N))
+    from scipy.stats import norm
+    z = norm.ppf(1 - alpha/2)
+    CD_dunn = z * se
+    print(f"[{metric}] SE(rank)={se:.4f} | CD(Dunn)={CD_dunn:.4f}")
 
     if control is not None:
         assert control in labels, f"Controllo '{control}' non tra {labels}"
-        test_to_use = "wilcoxon" if force_test is None else force_test
+        test_to_use = "nemenyi" if force_test is None else force_test
     else:
         test_to_use = "nemenyi" if force_test is None else force_test
-
-    if control is not None and k >= 3 and export_posthoc_table:
-        post = posthoc_vs_control(
-            pivot, control=control, lower_better=lower_better, alpha=alpha, correction="holm"
-        )
-        csv_path = os.path.join(outdir, f"{out_prefix}_posthoc_vs_{control}.csv")
-        post.to_csv(csv_path, index=False)
-        print(f"[{metric}] Post-hoc vs '{control}' salvato in: {csv_path}")
 
     kwargs = dict(
         lower_better=lower_better,
@@ -329,16 +298,13 @@ def make_cd_plot(
         return_p_values=False,
     )
 
-    fig_ax = plot_critical_difference(scores, labels, kwargs)
+    fig_ax = plot_critical_difference(scores, labels, **kwargs)
     fig, ax = fig_ax[:2]
 
-    title_suffix = ""
     if omnibus["test"] == "friedman":
-        p_id = omnibus["p_ID"]
-        title_suffix = f" — Friedman/Iman–Davenport p={p_id:.3g}"
+        ax.set_title(f"{metric} - p={omnibus['p_ID']:.3g}", fontsize=14)
     elif omnibus["test"] == "wilcoxon":
-        title_suffix = f" — Wilcoxon p={omnibus['p']:.3g}"
-    ax.set_title(f"CD Diagram – {metric}{title_suffix}", fontsize=14)
+        ax.set_title(f"{metric} - p={omnibus['p']:.3g}", fontsize=14)
 
     png_path = os.path.join(outdir, f"{out_prefix}.png")
     fig.savefig(png_path, bbox_inches="tight", dpi=png_dpi)
@@ -401,13 +367,10 @@ def make_mcm_plot(
     plt.close(fig)
     print(f"[{metric}] MCM saved as {save_formats} in {os.path.join(outdir, out_prefix)}.*")
 
-# =============================================================================
-# MAIN
-# =============================================================================
 if __name__ == "__main__":
-    FOLDER = "RESULTS"
+    FOLDER = "RESULTS_2"
     with_scorecard = True
-    OUTDIR = "csv_files_img"
+    OUTDIR = "csv_files_img_sparsity"
 
     BASELINE = None
     suffix = ""
@@ -419,6 +382,7 @@ if __name__ == "__main__":
         ("AUC (%)", False),
         ("F1 Score (%)", False),
         ("Time Training (s)", True),
+        ("Sparsity Ratio", False)
     ]
 
     df_all = load_model_csvs(

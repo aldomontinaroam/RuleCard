@@ -3,38 +3,27 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import ArrayLike
 from dataclasses import dataclass
-from collections import defaultdict
 from typing import Callable, Dict, Optional, Tuple, Union, List, Sequence
 
-from utils import load_preprocess, get_feature_importance, get_available_datasets
-
-import ast
-import time
-
 from FAST import FAST
-from tqdm import tqdm
 
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import (
     roc_auc_score, log_loss,
     accuracy_score, precision_score,
-    recall_score, f1_score, precision_recall_curve,
-    roc_curve, fbeta_score, balanced_accuracy_score,
-    matthews_corrcoef
+    recall_score, f1_score, precision_recall_curve
 )
 from sklearn.model_selection import train_test_split
 from sklearn.utils.validation import check_X_y, check_array
 from scipy.special import expit
 
 from joblib import Parallel, delayed
-from tqdm import tqdm
+from tqdm import tqdm as _tqdm
 import logging
 
 import numpy as np
-from itertools import product
 
-# ================ MODEL =======================
 def _sigmoid(z):
     out = np.empty_like(z, dtype=float)
     pos = z >= 0
@@ -43,10 +32,6 @@ def _sigmoid(z):
     ez = np.exp(z[neg])
     out[neg] = ez / (1.0 + ez)
     return out
-
-def _logit(p, eps=1e-12):
-    p = np.clip(p, eps, 1 - eps)
-    return np.log(p) - np.log(1 - p)
 
 @dataclass
 class _Stage:
@@ -572,7 +557,7 @@ class Model2D(ClassifierMixin, BaseEstimator):
             pbar = None
             if self.verbose == 1:
                 try:
-                    pbar = tqdm(
+                    pbar = _tqdm(
                         total=T,
                         desc="Training",
                         leave=False,
@@ -1047,7 +1032,6 @@ class Model2D(ClassifierMixin, BaseEstimator):
         t.fit(Xij, residual, sample_weight=sample_weight)
         return t, t.predict(Xij)
 
-
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -1312,7 +1296,6 @@ class Scorecard:
                    PDO: int = 50,
                    score0: float = 0.0,
                    odds0: Optional[float] = None,
-                   lr_by_stage: Optional[Union[float, Dict[int, float]]] = 1.0,
                    bounds_col: str = 'bounds',
                    on_missing: str = 'ignore',
                    return_sparse: bool = True
@@ -1473,179 +1456,3 @@ class Scorecard:
     def rules_table(self) -> pd.DataFrame:
         return self.rules_df_points.copy()
 
-def rulecard_complexity(sc, X: pd.DataFrame) -> dict:
-    rules = sc.rules_table()
-    n_rules = int(len(rules))
-
-    if n_rules > 0:
-        if "features" in rules.columns:
-            lists = rules["features"].apply(
-                lambda xs: list(map(str, xs)) if isinstance(xs, (list, tuple, set)) else []
-            ).tolist()
-        else:
-            bcol = getattr(sc, "bounds_col", "bounds")
-            lists = rules[bcol].apply(
-                lambda b: list(map(str, getattr(b, "keys", lambda: [])()))
-            ).tolist()
-        unique_features = sorted(set().union(*lists)) if lists else []
-    else:
-        unique_features = []
-
-    n_unique_features = len(unique_features)
-
-    if n_rules > 0:
-        A = sc.make_activation_matrix(
-            X, rules,
-            bounds_col=getattr(sc, "bounds_col", "bounds"),
-            on_missing=getattr(sc, "on_missing", "ignore"),
-            return_sparse=True
-        )
-        if hasattr(A, "getnnz"):
-            active_rules_per_sample = np.asarray(A.getnnz(axis=1)).reshape(-1)
-        else:
-            active_rules_per_sample = A.sum(axis=1).astype(int)
-        active_rules_mean = float(np.mean(active_rules_per_sample))
-    else:
-        active_rules_mean = 0.0
-
-    return dict(
-        n_rules=n_rules,
-        n_unique_features=n_unique_features,
-        active_rules_mean=active_rules_mean
-    )
-
-
-from utils import get_available_datasets, load_preprocess, get_feature_importance
-from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-
-COMP_MAP = {
-    "n_rules": "Total Rules",
-    "n_unique_features": "Unique Features",
-    "active_rules_mean": "Avg Active Rules",
-}
-
-best_config_dataset = pd.read_csv("05_1_best_configurations.csv")
-
-best_config_dataset = best_config_dataset.rename(columns={"Unnamed: 0": "dataset"})
-best_configs = {row["dataset"]: row["best_params"] for _, row in best_config_dataset.iterrows()}
-
-sc_best_config_dataset = pd.read_csv("06_scorecard_best_configurations.csv")
-sc_best_config_dataset = sc_best_config_dataset.rename(columns={"Unnamed: 0": "dataset"})
-sc_best_configs = {}
-for _, row in sc_best_config_dataset.iterrows():
-    params = row[["min_support", "PDO", "max_rules", "calibrator"]].to_dict()
-
-    if pd.isna(params["max_rules"]):
-        params["max_rules"] = None
-    else:
-        params["max_rules"] = int(params["max_rules"])
-
-    sc_best_configs[row["dataset"]] = params
-
-SEEDS = [0, 17, 22, 36, 42]
-
-all_results = {}
-
-for name, info in tqdm(get_available_datasets().items()):
-    data = load_preprocess(name)
-    X, y = data["X"], data["y"]
-
-    per_seed_metrics = defaultdict(list)
-
-    for seed in SEEDS:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=seed, stratify=y
-        )
-
-        if name in best_configs:
-            params = ast.literal_eval(best_configs[name])
-        else:
-            params = {"max_depth": 3, "lr": 1.0, "group_mode": "mixed", "selection": "greedy"}
-        
-        if name in sc_best_configs:
-            sc_params = sc_best_configs[name]
-        else:
-            sc_params = {"min_support": 0.005, "PDO": 50, "max_rules": None, "calibrator": "isotonic"}
-
-        clf = Model2D(
-            max_depth=params["max_depth"],
-            lr=params["lr"],
-            group_mode=params["group_mode"],
-            selection=params["selection"],
-            early_stopping=True,
-            early_stopping_metric="auc",
-            feature_importance_fn=get_feature_importance,
-            verbose=0
-        )
-        start = time.time()
-        clf.fit(X_train, y_train)
-
-        sc = Scorecard.from_model(
-            clf,
-            X_train, y_train,
-            feature_names=getattr(clf, "feature_names_in_", X_train.columns),
-            min_support=sc_params["min_support"],
-            PDO=sc_params["PDO"],
-            max_rules=sc_params["max_rules"],
-            bounds_col='bounds',
-            on_missing='ignore',
-            return_sparse=True
-        )
-        sc.fit_calibrator(X_train, y_train, method=sc_params["calibrator"], n_splits=5)
-        end = time.time()
-
-        comp = rulecard_complexity(sc, X_test)
-        for src, dst in COMP_MAP.items():
-            per_seed_metrics[dst].append(comp.get(src, np.nan))
-
-        S_test = sc.predict_scores(X_test)
-        proba_test = sc.predict_proba(X_test)
-        yhat_test = sc.predict(X_test, 0.5)
-
-        acc = accuracy_score(y_test, yhat_test)
-        prec = precision_score(y_test, yhat_test)
-        rec = recall_score(y_test, yhat_test)
-        f1 = f1_score(y_test, yhat_test)
-        bal_acc = balanced_accuracy_score(y_test, yhat_test)
-        mcc = matthews_corrcoef(y_test, yhat_test)
-        error_rate = 1 - acc
-        auc = roc_auc_score(y_test, proba_test[:, 1])
-
-        per_seed_metrics["Time Training (s)"].append(end - start)
-        per_seed_metrics["Accuracy (%)"].append(acc * 100.0)
-        per_seed_metrics["Precision (%)"].append(prec * 100.0)
-        per_seed_metrics["Recall (%)"].append(rec * 100.0)
-        per_seed_metrics["F1 Score (%)"].append(f1 * 100.0)
-        per_seed_metrics["Balanced Accuracy (%)"].append(bal_acc * 100.0)
-        per_seed_metrics["MCC (%)"].append(mcc * 100.0)
-        per_seed_metrics["Error Rate (%)"].append(error_rate * 100.0)
-        per_seed_metrics["AUC (%)"].append(auc * 100.0)
-
-        p = X_test.shape[1]
-        n_rules = comp.get("n_rules", 0)
-        n_uf = comp.get("n_unique_features", 0)
-        act_mean = comp.get("active_rules_mean", 0.0)
-        sparsity_ratio = 1.0 - (n_uf / p) if p > 0 else np.nan
-
-        per_seed_metrics["Sparsity Ratio"].append(sparsity_ratio)
-        per_seed_metrics["Active Rules Mean"].append(act_mean)
-    
-    all_results[name] = {k: (np.mean(v), np.std(v)) for k, v in per_seed_metrics.items()}
-
-df_mean = pd.DataFrame.from_dict(
-    {name: {k: v[0] for k, v in metrics.items()} for name, metrics in all_results.items()},
-    orient="index"
-)
-df_std = pd.DataFrame.from_dict(
-    {name: {k: v[1] for k, v in metrics.items()} for name, metrics in all_results.items()},
-    orient="index"
-)
-
-df_all_results = pd.concat([df_mean, df_std], axis=1, keys=["mean", "std"])
-df_all_results = df_all_results.swaplevel(axis=1).sort_index(axis=1, level=0)
-
-#df_all_results.to_csv("06_1_scorecard_performance_results_for_competitors_mean_std.csv")
-
-means = df_all_results.xs('mean', axis=1, level=1)
-means.round(3).to_csv("06_1_RULECARD_PERFORMANCE.csv")
