@@ -76,12 +76,6 @@ class ScorecardVisualizer:
 
 
     def _families_from_features(self, feats: Any) -> List[str]:
-        """
-        Restituisce 1 o 2 'famiglie' leggibili per una regola, a partire da features/bounds.
-        - OHE: usa la famiglia (prima della '_' nella mappatura) es. 'marital_status'
-        - Numeriche: usa il nome base es. 'age'
-        - Pairwise: restituisce due famiglie ordinate
-        """
         fams = []
         if isinstance(feats, (list, tuple)):
             for f in feats:
@@ -95,11 +89,6 @@ class ScorecardVisualizer:
     def compute_factors_share(
         self, *, top_k: int = 5
     ) -> Dict[str, Any]:
-        """
-        Calcola la 'torta dei fattori': quota di impatto per famiglia.
-        impact = support * points (assoluto per la somma).
-        Aggrega anche regole pairwise (fam1 & fam2).
-        """
         df = self.scorecard.rules_df_points.copy()
         if "support" not in df.columns or "points" not in df.columns:
             return {"items": [], "total_abs_impact": 0.0}

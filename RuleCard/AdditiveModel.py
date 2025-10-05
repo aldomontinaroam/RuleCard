@@ -40,7 +40,7 @@ class _Stage:
     kind: str # 'uni' or 'pair'
     score: float = 0.0 # gain on train (loss_before - loss_after)
 
-logger = logging.getLogger("Model2D")
+logger = logging.getLogger("AdditiveModel")
 if not logger.hasHandlers():
     handler = logging.StreamHandler()
     formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
@@ -50,7 +50,7 @@ if not logger.hasHandlers():
     logger.setLevel(logging.INFO)
 
 
-class Model2D(ClassifierMixin, BaseEstimator):
+class AdditiveModel(ClassifierMixin, BaseEstimator):
 
     def __init__(
         self,

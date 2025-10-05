@@ -11,3 +11,8 @@ COMPETITORS/.DS_Store
 COMPETITORS/models/__pycache__/
 COMPETITORS/models/*.pyc
 COMPETITORS/models/.DS_Store
+
+RuleCard/__pycache__/
+RuleCard/*.pyc
+RuleCard/.DS_Store
+RuleCard/.env/
