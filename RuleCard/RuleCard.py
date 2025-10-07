@@ -45,6 +45,19 @@ def _clean_column_names(columns):
         cleaned.append(new_name)
     return cleaned
 
+def get_feature_importance(X_train, y_train):
+    selector = SelectKBest(score_func=chi2, k='all')
+    selector.fit(X_train, y_train)
+    scores = selector.scores_
+    feature_names = X_train.columns
+    importance = pd.DataFrame({
+        'feature': feature_names,
+        'importance': scores
+    }).sort_values(by='importance', ascending=False).reset_index(drop=True)
+
+    feature_order = importance['feature'].tolist()
+    return feature_order, importance
+
 
 def load_data(
     file_path: str,
