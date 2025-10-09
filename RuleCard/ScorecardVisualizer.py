@@ -574,7 +574,7 @@ class ScorecardVisualizer:
         pat_threshold = re.compile(
             r"(?P<tok>[A-Za-z][A-Za-z0-9_]+)"
             r"\s*(?P<op><=|>=|<|>)\s*"
-            r"(?P<val>(?:0|1)(?:\.\d+)?)", 
+            r"(?P<val>(?:0(?:\.\d+)?|1(?:\.0+)?))(?![\d.])",
             re.IGNORECASE,
         )
         pat_space_exact = re.compile(
@@ -588,9 +588,10 @@ class ScorecardVisualizer:
             r"(?P<fam>[A-Za-z][A-Za-z0-9_]*)\s+"
             r"(?P<cat>[A-Za-z0-9_]+)\s*"
             r"(?P<op><=|>=|<|>)\s*"
-            r"(?P<val>(?:0|1)(?:\.\d+)?)",
+            r"(?P<val>(?:0(?:\.\d+)?|1(?:\.0+)?))(?![\d.])",
             re.IGNORECASE,
         )
+
 
         def _render_yesno(fam: str, cat: str, present: bool) -> str:
             return f"{self._clean_identifier(fam)} {self._clean_identifier(cat)} {'YES' if present else 'NO'}"
@@ -619,6 +620,8 @@ class ScorecardVisualizer:
                 return m.group(0)
             fam, cat = fc
             eps = 1e-9
+            if not (0.0 - eps <= thr <= 1.0 + eps):
+                return m.group(0)
             if op in (">", ">=") and thr >= 0.5 - eps:
                 return _render_yesno(fam, cat, True)
             if op in ("<", "<=") and thr <= 0.5 + eps:
@@ -639,6 +642,8 @@ class ScorecardVisualizer:
             op  = m.group("op")
             thr = float(m.group("val"))
             eps = 1e-9
+            if not (0.0 - eps <= thr <= 1.0 + eps):
+                return m.group(0)
             if op in (">", ">=") and thr >= 0.5 - eps:
                 return _render_yesno(fam, cat, True)
             if op in ("<", "<=") and thr <= 0.5 + eps:
