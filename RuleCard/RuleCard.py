@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.feature_selection import SelectKBest, chi2
 
 import time
 from typing import Any, Dict, Optional, Union
@@ -45,31 +46,20 @@ def _clean_column_names(columns):
         cleaned.append(new_name)
     return cleaned
 
-def get_feature_importance(X_train, y_train):
-    selector = SelectKBest(score_func=chi2, k='all')
-    selector.fit(X_train, y_train)
-    scores = selector.scores_
-    feature_names = X_train.columns
-    importance = pd.DataFrame({
-        'feature': feature_names,
-        'importance': scores
-    }).sort_values(by='importance', ascending=False).reset_index(drop=True)
-
-    feature_order = importance['feature'].tolist()
-    return feature_order, importance
-
 
 def load_data(
     file_path: str,
     sep: str = ",",
     class_col: str | None = None,
     positive_class: str | None = None,
-    id_col: str | None = None
+    id_col: str | None = None,
+    categorical_cols: list[str] | None = None,
 ):
     """
     Load and preprocess a dataset:
     - Cleans column names
     - Handles target column (`class_col`) and optional ID column (`id_col`)
+    - Allows explicit specification of categorical columns (even if numeric)
     - Numeric missing values -> arbitrary out-of-range value
     - Categorical missing values -> "Unknown"
     - One-hot encoding on categorical features
@@ -81,6 +71,7 @@ def load_data(
     - positive_class: value to be mapped to 1 (other classes to 0). 
                       If None → multi-class mapping
     - id_col: identifier column to exclude from preprocessing
+    - categorical_cols: list of columns to treat as categorical (even if numeric)
 
     Returns:
     - df_final: preprocessed DataFrame (features only)
@@ -117,16 +108,16 @@ def load_data(
         y = df[class_col].map(class_mapping)
         df = df.drop(columns=[class_col])
 
-    obj_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
-    if class_col in obj_cols:
-        obj_cols.remove(class_col)
+    if categorical_cols is None:
+        cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    else:
+        cat_cols = [c for c in categorical_cols if c in df.columns]
 
-    for col in obj_cols:
-        s = df[col].astype(str).str.strip()
-        s = s.mask(s == '?', np.nan)
-        df[col] = s
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    for col in cat_cols:
+        df[col] = df[col].astype(str).str.strip()
+        df[col] = df[col].mask(df[col] == '?', np.nan).fillna("Unknown")
+
+    num_cols = [c for c in df.columns if c not in cat_cols]
 
     for col in num_cols:
         if df[col].isnull().any():
@@ -137,12 +128,8 @@ def load_data(
                 out_of_range_val = 999999
             df[col] = df[col].fillna(out_of_range_val)
 
-    for col in cat_cols:
-        df[col] = df[col].fillna("Unknown")
-
     encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
     encoded_array = encoder.fit_transform(df[cat_cols])
-
     encoded_cols = _clean_column_names(encoder.get_feature_names_out(cat_cols))
     df_encoded = pd.DataFrame(encoded_array, columns=encoded_cols, index=df.index)
 
@@ -155,6 +142,19 @@ def load_data(
 
     return df_final, y, ids, col_mapping, class_mapping
 
+
+def get_feature_importance(X_train, y_train):
+    selector = SelectKBest(score_func=chi2, k='all')
+    selector.fit(X_train, y_train)
+    scores = selector.scores_
+    feature_names = X_train.columns
+    importance = pd.DataFrame({
+        'feature': feature_names,
+        'importance': scores
+    }).sort_values(by='importance', ascending=False).reset_index(drop=True)
+
+    feature_order = importance['feature'].tolist()
+    return feature_order, importance
 
 
 
@@ -251,6 +251,10 @@ class RuleCardClassifier(BaseEstimator, ClassifierMixin):
         calibrator__max_iter: int = 2000,
         # Prediction
         predict_threshold: float = 0.5,
+
+        col_mapping_: Optional[Dict[str, list[str]]] = None,
+        scaler_: Optional[Any] = None,
+        scaler_feature_names_: Optional[list[str]] = None,
         # AdditiveModel params (nested)
         **model_params: Any,
     ) -> None:
@@ -271,6 +275,9 @@ class RuleCardClassifier(BaseEstimator, ClassifierMixin):
         self.predict_threshold = predict_threshold
         # nested params for AdditiveModel
         self.model_params = dict(model_params)
+        self.col_mapping_ = col_mapping_
+        self.scaler_ = scaler_
+        self.scaler_feature_names_ = scaler_feature_names_
 
     def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray],
             sample_weight: Optional[np.ndarray] = None) -> "RuleCardClassifier":
@@ -374,7 +381,7 @@ class RuleCardClassifier(BaseEstimator, ClassifierMixin):
         check_is_fitted(self, "scorecard_")
         if ScorecardVisualizer is None:
             raise ImportError("ScorecardVisualizer is not available.")
-        return ScorecardVisualizer(scorecard=self.scorecard_)
+        return ScorecardVisualizer(scorecard=self.scorecard_, scaler=self.scaler_, scaler_feature_names=self.scaler_feature_names_, mapping=self.col_mapping_)
 
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
         # top-level params

@@ -25,6 +25,7 @@ class ScorecardVisualizer:
     scaler: Any = None
     scaler_feature_names: Optional[List[str]] = None
     mapping: Optional[Dict[str, List[str]]] = None
+    sig_digits: int = 2
     
     _ohe_lookup: Dict[str, Tuple[str, str]] = field(default_factory=dict, init=False, repr=False)
 
@@ -101,10 +102,6 @@ class ScorecardVisualizer:
         df["__impact__"] = (df["support"].astype(float) * df["points"].astype(float)).abs()
 
         byfam = (df.groupby("__family__", as_index=False)
-                .agg(abs_impact=(".__impact__".replace(".", ""), "sum")
-                        if "__impact__" not in df.columns else ("__impact__", "sum"),
-                        n_rules=("points", "count")))
-        byfam = (df.groupby("__family__", as_index=False)
                 .agg(abs_impact=("__impact__", "sum"),
                         n_rules=("points", "count")))
 
@@ -137,14 +134,14 @@ class ScorecardVisualizer:
         if which == "global":
             return dict(
                 wrap_width=70,
-                base_row_h=0.08,
+                base_row_h=0.06,
                 row_gap=0.015,
                 min_row_inch=0.02,
                 cell_pad=0.01,
                 col_widths=(0.9, 0.1),
                 font_min=8,
                 font_max=11,
-                max_fig_height=12,
+                max_fig_height=10,
             )
 
         return dict(
@@ -222,7 +219,7 @@ class ScorecardVisualizer:
         def repl_interval(m):
             lo = float(m.group("lo")); hi = float(m.group("hi")); vr = m.group("var")
             lo_i, hi_i = self._inverse_feature_values(vr, [lo, hi])
-            return f"{self._fmt_num(lo_i)} {m.group('op1')} {vr} {m.group('op2')} {self._fmt_num(hi_i)}"
+            return f"{self._fmt_num(lo_i[0])} {m.group('op1')} {vr} {m.group('op2')} {self._fmt_num(hi_i[1])}"
         s = pat_interval.sub(repl_interval, str(expr))
 
         # 2) var <op> num
@@ -252,6 +249,11 @@ class ScorecardVisualizer:
     _num_pat_right = re.compile(
         r"^\s*(?P<v>[-+]?\d+(?:\.\d+)?)\s*(?P<op><=|>=|<|>)\s*(?P<var>[A-Za-z0-9_.]+)\s*$"
     )
+
+    _num_pat = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+
+    def _shrink_numbers_in_str(self, s: str) -> str:
+        return self._num_pat.sub(lambda m: self._fmt_num(float(m.group(0))), str(s))
 
     @staticmethod
     def _merge_intervals(bins: List[Tuple[Optional[float], bool, Optional[float], bool, float]]
@@ -321,11 +323,22 @@ class ScorecardVisualizer:
         right = "≤" if hi_inc else "<"
         return f"{self._fmt_num(lo)} {left} {v} {right} {self._fmt_num(hi)}"
 
-    @staticmethod
-    def _fmt_num(v: float) -> str:
+    def _fmt_num(self, v: float) -> str:
+        v = float(v)
         if np.isfinite(v) and abs(v - round(v)) < 1e-9:
-            return f"{int(round(v))}"
-        return f"{v:.6g}"
+            return str(int(round(v)))
+
+        if v == 0.0:
+            return "0"
+
+        sig = max(1, int(self.sig_digits))
+        dec = max(0, sig - 1 - int(np.floor(np.log10(abs(v)))))
+
+        s = f"{v:.{dec}f}"
+        s = s.rstrip("0").rstrip(".")
+        return s
+
+
     
     def global_table(
         self,
@@ -337,12 +350,16 @@ class ScorecardVisualizer:
 
         df = self.scorecard.rules_df_points.copy()
 
-        default_cols = ["stage", "kind", "expr", "points", "weight", "support", "pos_rate"]
+        default_cols = ["stage", "kind", "expr", "points", "weight",
+                    "support", "pos_rate", "features", "bounds"]
         cols = [c for c in (columns or default_cols) if c in df.columns]
         if not cols:
             cols = [c for c in default_cols if c in df.columns]
 
         out = df[cols].copy()
+
+        if "expr" in out.columns:
+            out["expr"] = out["expr"].map(lambda e: self._shrink_numbers_in_str(self._inverse_thresholds(str(e))))
 
         if sort_by is not None:
             if isinstance(sort_by, str):
@@ -397,6 +414,11 @@ class ScorecardVisualizer:
 
         proba = self._predict_proba_from_score([S_points], factor=sc.factor, offset=sc.offset)[0]
         yhat = int(proba[1] >= 0.5)
+
+        if "expr" in df_local.columns:
+            df_local["expr"] = df_local["expr"].map(
+                lambda e: self._shrink_numbers_in_str(self._inverse_thresholds(str(e)))
+            )
         return df_local, S_points, proba, yhat
 
     @staticmethod
@@ -507,6 +529,39 @@ class ScorecardVisualizer:
                         else f"{fam_label} ≠ {cat}")
             return f"{fam_label} {cat}" if binary_like else f"{fam_label} = {cat}"
 
+    def _parse_numeric_interval(
+        self, s: str
+    ) -> Optional[Tuple[str, Optional[float], bool, Optional[float], bool]]:
+        t = str(s).strip()
+
+        # num < var <= num
+        m = self._num_pat_interval.fullmatch(t)
+        if m:
+            lo = float(m.group("lo")); hi = float(m.group("hi"))
+            var = m.group("var")
+            lo_inc = (m.group("op1") == "<=")
+            hi_inc = (m.group("op2") == "<=")
+            return var, lo, lo_inc, hi, hi_inc
+
+        # var <op> num
+        m = self._num_pat_left.fullmatch(t)
+        if m:
+            var, op, v = m.group("var"), m.group("op"), float(m.group("v"))
+            if op == "<":   return var, None, True,  v, False
+            if op == "<=":  return var, None, True,  v, True
+            if op == ">":   return var, v,    False, None, True
+            if op == ">=":  return var, v,    True,  None, True
+
+        # num <op> var
+        m = self._num_pat_right.fullmatch(t)
+        if m:
+            v, op, var = float(m.group("v")), m.group("op"), m.group("var")
+            if op == "<":   return var, v, False, None, True         # v < var  -> lo=(v, open)
+            if op == "<=":  return var, v, True,  None, True         # v <= var -> lo=(v, closed)
+            if op == ">":   return var, None, True, v, False         # v > var  -> var < v
+            if op == ">=":  return var, None, True, v, True          # v >= var -> var <= v
+
+        return None
 
 
     def _cond_pretty_all(self, cond: str, vocab: Dict[str, List[str]]) -> str:
@@ -516,65 +571,87 @@ class ScorecardVisualizer:
             r"(?P<val>0|1|YES|NO|True|False)",
             re.IGNORECASE,
         )
-
         pat_threshold = re.compile(
             r"(?P<tok>[A-Za-z][A-Za-z0-9_]+)"
             r"\s*(?P<op><=|>=|<|>)\s*"
-            r"(?P<val>0\.\d+)",
+            r"(?P<val>(?:0|1)(?:\.\d+)?)", 
             re.IGNORECASE,
         )
+        pat_space_exact = re.compile(
+            r"(?P<fam>[A-Za-z][A-Za-z0-9_]*)\s+"
+            r"(?P<cat>[A-Za-z0-9_]+)\s*"
+            r"(?P<op>:|==|!=)\s*"
+            r"(?P<val>0|1|YES|NO|True|False)",
+            re.IGNORECASE,
+        )
+        pat_space_threshold = re.compile(
+            r"(?P<fam>[A-Za-z][A-Za-z0-9_]*)\s+"
+            r"(?P<cat>[A-Za-z0-9_]+)\s*"
+            r"(?P<op><=|>=|<|>)\s*"
+            r"(?P<val>(?:0|1)(?:\.\d+)?)",
+            re.IGNORECASE,
+        )
+
+        def _render_yesno(fam: str, cat: str, present: bool) -> str:
+            return f"{self._clean_identifier(fam)} {self._clean_identifier(cat)} {'YES' if present else 'NO'}"
 
         def repl_exact(m):
             tok = m.group("tok")
             op  = "==" if m.group("op") == ":" else m.group("op")
             val = m.group("val")
-
             base = self._strip_prefix(tok)
             fc = self._split_ohe(base)
             if not fc:
                 return m.group(0)
-
             fam, cat = fc
-            return self._cond_pretty(f"{fam}_{cat} {op} {val}", fam, vocab)
+            present = self._is_true_token(val)
+            if op == "!=":
+                present = not present
+            return _render_yesno(fam, cat, present)
 
         def repl_threshold(m):
             tok = m.group("tok")
-            op = m.group("op")
-            val = float(m.group("val"))
-
+            op  = m.group("op")
+            thr = float(m.group("val"))
             base = self._strip_prefix(tok)
             fc = self._split_ohe(base)
             if not fc:
                 return m.group(0)
-
             fam, cat = fc
-            cats_obs = vocab.get(fam, [])
-            
-            if self.mapping and fam in self.mapping:
-                cats_map = [self._strip_prefix(c).replace(f"{fam}_", "", 1) for c in self.mapping[fam]]
-                binary_like = (len(set(cats_map)) == 2)
-            else:
-                binary_like = (len(cats_obs) == 2)
+            eps = 1e-9
+            if op in (">", ">=") and thr >= 0.5 - eps:
+                return _render_yesno(fam, cat, True)
+            if op in ("<", "<=") and thr <= 0.5 + eps:
+                return _render_yesno(fam, cat, False)
+            return m.group(0)
 
-            fam_label = self._clean_identifier(fam)
-            cat_label = self._clean_identifier(cat)
-            
-            if op in (">", ">="):
-                if val < 0.5:
-                    return m.group(0)
-                return f"{fam_label} {cat_label}" if binary_like else f"{fam_label} = {cat_label}"
-            else:
-                if val > 0.5:
-                    return m.group(0)
-                other = self._other_label(fam, cat, cats_obs)
-                if binary_like and other is not None:
-                    return f"{fam_label} {other}"
-                return f"{fam_label} ≠ {cat_label}"
+        def repl_space_exact(m):
+            fam = m.group("fam"); cat = m.group("cat")
+            op  = "==" if m.group("op") == ":" else m.group("op")
+            val = m.group("val")
+            present = self._is_true_token(val)
+            if op == "!=":
+                present = not present
+            return _render_yesno(fam, cat, present)
 
-        result = pat_exact.sub(repl_exact, cond)
+        def repl_space_threshold(m):
+            fam = m.group("fam"); cat = m.group("cat")
+            op  = m.group("op")
+            thr = float(m.group("val"))
+            eps = 1e-9
+            if op in (">", ">=") and thr >= 0.5 - eps:
+                return _render_yesno(fam, cat, True)
+            if op in ("<", "<=") and thr <= 0.5 + eps:
+                return _render_yesno(fam, cat, False)
+            return m.group(0)
+
+        result = cond
+        result = pat_exact.sub(repl_exact, result)
         result = pat_threshold.sub(repl_threshold, result)
-        
+        result = pat_space_exact.sub(repl_space_exact, result)
+        result = pat_space_threshold.sub(repl_space_threshold, result)
         return result
+
     @staticmethod
     def _merge_active_bins(bins):
         if not bins:
@@ -635,8 +712,10 @@ class ScorecardVisualizer:
         for i in range(len(bounds) - 1):
             lo, hi = bounds[i], bounds[i + 1]
 
-            lo_inc = (lo == -float("inf"))
-            hi_inc = (hi == float("inf"))
+            #lo_inc = (lo == -float("inf"))
+            #hi_inc = (hi == float("inf"))
+            lo_inc = True
+            hi_inc = True
 
             pts_tot = 0.0
             for blo, blo_inc, bhi, bhi_inc, bpts in bins:
@@ -664,7 +743,11 @@ class ScorecardVisualizer:
         include_pairs: bool = True,
         sort_bins_by: str = "points_desc",
         selected_rule_ids: Optional[Iterable[int]] = None,
-        sample_row: Optional[pd.Series] = None):
+        sample_row: Optional[pd.Series] = None,
+        min_abs_points: Optional[float] = None,
+        aggregate_label: Optional[str] = None):
+
+        ADD_DUMMY_NO_ROW = True
 
         df = self._ensure_dataframe(df_in)
         if "condition" not in df.columns and "expr" in df.columns:
@@ -739,7 +822,6 @@ class ScorecardVisualizer:
                 aggregated[fam]["stage_min"] = min(aggregated[fam]["stage_min"], int(row["stage"]))
             
             elif bounds and isinstance(feats, (list, tuple)) and len(feats) == 1:
-
                 var = str(feats[0])
                 b = bounds.get(var, None)
                 if b and ("lb" in b and "ub" in b):
@@ -750,13 +832,26 @@ class ScorecardVisualizer:
                     key = f"NUM::{base_var}"
                     agg = aggregated.get(key)
                     if agg is None:
-                        agg = aggregated[key] = {
-                            "var": base_var,
-                            "bins": [],
-                            "stage_min": int(row["stage"])
-                        }
+                        agg = aggregated[key] = {"var": base_var, "bins": [], "stage_min": int(row["stage"])}
+
+                    # >>> PATCH: inverse-transform dei bound se c'è uno scaler
+                    if self.scaler is not None:
+                        vals, tags = [], []
+                        if (lo is not None) and np.isfinite(lo):
+                            vals.append(lo); tags.append("lo")
+                        if (hi is not None) and np.isfinite(hi):
+                            vals.append(hi); tags.append("hi")
+                        if vals:
+                            inv = self._inverse_feature_values(var, vals)
+                            k = 0
+                            if "lo" in tags:
+                                lo = inv[k]; k += 1
+                            if "hi" in tags:
+                                hi = inv[k]
+
                     agg["bins"].append((lo, lo_inc, hi, hi_inc, pts))
                     agg["stage_min"] = min(agg["stage_min"], int(row["stage"]))
+
                 else:
                     label = self._clean_expr_for_display(str(row["condition"]))
                     plain_rows.append({"label": label, "points": pts, "stage_min": int(row["stage"])})
@@ -765,24 +860,61 @@ class ScorecardVisualizer:
                 cond = str(row["condition"])
                 cond = self._inverse_thresholds(cond)
                 cond_no_pref = self._strip_prefix(cond)
-                cond_pretty  = self._cond_pretty_all(cond_no_pref, vocab)
+
+                iv = self._parse_numeric_interval(cond_no_pref)
+                if iv is not None and (feats is None or (isinstance(feats, (list, tuple)) and len(feats) <= 1)):
+                    var, lo, lo_inc, hi, hi_inc = iv
+                    base_var = self._strip_prefix(var)
+                    key = f"NUM::{base_var}"
+                    agg = aggregated.get(key)
+                    if agg is None:
+                        agg = aggregated[key] = {"var": base_var, "bins": [], "stage_min": int(row["stage"])}
+                    agg["bins"].append((lo, lo_inc, hi, hi_inc, pts))
+                    agg["stage_min"] = min(agg["stage_min"], int(row["stage"]))
+                    continue
+
+                cond_pretty = self._cond_pretty_all(cond_no_pref, vocab)
                 label = self._clean_expr_for_display(cond_pretty)
                 plain_rows.append({"label": label, "points": pts, "stage_min": int(row["stage"])})
+
 
         uni_rows = [["Bin", "Score"]]
         uni_pts  = []
         uni_items: List[Dict[str, Any]] = []
 
+        is_local = sample_row is not None 
+
         for fam, info in aggregated.items():
             if "cats" not in info:
                 continue
-            active_cat = active_cat_by_fam.get(fam, next(iter(info["cats"])))
             fam_label = self._clean_identifier(fam)
-            cat_label = self._clean_identifier(active_cat)
-            label = f"{fam_label} {cat_label}"
-            uni_items.append({"label": label, "points": float(info["points"]), "stage_min": int(info["stage_min"])})
 
-        is_local = sample_row is not None
+            if is_local:
+                active_cat = active_cat_by_fam.get(fam, None)
+                if active_cat is not None and active_cat in info["cats"]:
+                    pts = float(info["cats"][active_cat])
+                    cat_label = self._clean_identifier(active_cat)
+                    label = f"{fam_label} {cat_label}"
+                    uni_items.append({
+                        "label": label,
+                        "points": pts,
+                        "stage_min": int(info["stage_min"])
+                    })
+            else:
+                for cat, pts in info["cats"].items():
+                    cat_label = self._clean_identifier(cat)
+                    uni_items.append({
+                        "label": f"{fam_label} {cat_label}",
+                        "points": float(pts),
+                        "stage_min": int(info["stage_min"])
+                    })
+                    if ADD_DUMMY_NO_ROW:
+                        uni_items.append({
+                            "label": f"{fam_label} {cat_label} NO",
+                            "points": 0.0,
+                            "stage_min": int(info["stage_min"])
+                        })
+
         for key, info in aggregated.items():
             if not key.startswith("NUM::"):
                 continue
@@ -820,6 +952,33 @@ class ScorecardVisualizer:
         else:
             uni_items.sort(key=lambda d: (d["stage_min"], -d["points"], d["label"]))
 
+        if min_abs_points is not None:
+            thr = float(min_abs_points)
+            base_labels = {"[BASE]"}
+            keep_uni, small_uni = [], []
+            for it in uni_items:
+                lbl = str(it.get("label", ""))
+                if lbl in base_labels:
+                    keep_uni.append(it)
+                elif abs(float(it["points"])) >= thr:
+                    keep_uni.append(it)
+                else:
+                    small_uni.append(it)
+            if small_uni:
+                small_sum = float(sum(x["points"] for x in small_uni))
+                lab = aggregate_label or f"Other (|score| < {int(round(thr))})"
+                keep_uni.append({
+                    "label": lab,
+                    "points": small_sum,
+                    "stage_min": max([k["stage_min"] for k in keep_uni], default=10**9) + 1
+                })
+            if sort_bins_by == "points_desc":
+                keep_uni.sort(key=lambda d: (-d["points"], d["stage_min"], d["label"]))
+            else:
+                keep_uni.sort(key=lambda d: (d["stage_min"], -d["points"], d["label"]))
+            uni_items = keep_uni
+
+
         for it in uni_items:
             uni_rows.append([it["label"], f"{int(round(it['points'])):+d}"])
             uni_pts.append(it["points"])
@@ -835,6 +994,51 @@ class ScorecardVisualizer:
                 cond_display = self._clean_expr_for_display(cond_pretty)
                 pair_rows.append([cond_display, f"{int(round(pts)):+d}"])
                 pair_pts.append(pts)
+        
+        pair_rows, pair_pts = [], []
+        if include_pairs and not df_pair.empty:
+            pair_items = []
+            for _, row in df_pair.iterrows():
+                pts = float(row["points"])
+                cond = self._inverse_thresholds(str(row["condition"]))
+                cond_no_pref = self._strip_prefix(cond)
+                cond_pretty  = self._cond_pretty_all(cond_no_pref, vocab)
+                cond_display = self._clean_expr_for_display(cond_pretty)
+                pair_items.append({
+                    "label": cond_display,
+                    "points": pts,
+                    "stage_min": int(row.get("stage", 10**6))
+                })
+
+            if sort_bins_by == "points_desc":
+                pair_items.sort(key=lambda d: (-d["points"], d["stage_min"], d["label"]))
+            else:
+                pair_items.sort(key=lambda d: (d["stage_min"], -d["points"], d["label"]))
+
+            if min_abs_points is not None:
+                thr = float(min_abs_points)
+                keep_pair = [it for it in pair_items if abs(float(it["points"])) >= thr]
+                small_pair = [it for it in pair_items if abs(float(it["points"])) < thr]
+                if small_pair:
+                    small_sum = float(sum(x["points"] for x in small_pair))
+                    lab = aggregate_label or f"Other (|score| < {int(round(thr))})"
+                    keep_pair.append({
+                        "label": lab,
+                        "points": small_sum,
+                        "stage_min": max([k["stage_min"] for k in keep_pair], default=10**9) + 1
+                    })
+                if sort_bins_by == "points_desc":
+                    keep_pair.sort(key=lambda d: (-d["points"], d["stage_min"], d["label"]))
+                else:
+                    keep_pair.sort(key=lambda d: (d["stage_min"], -d["points"], d["label"]))
+                pair_items = keep_pair
+
+
+            if pair_items:
+                pair_rows.append(["Bin", "Score"])
+                for it in pair_items:
+                    pair_rows.append([it["label"], f"{int(round(it['points'])):+d}"])
+                    pair_pts.append(it["points"])
 
         return (uni_rows, uni_pts), (pair_rows, pair_pts)
     
@@ -967,6 +1171,8 @@ class ScorecardVisualizer:
         font_min: Optional[int] = None,
         font_max: Optional[int] = None,
         max_fig_height: Optional[float] = None,
+        min_abs_points: Optional[float] = None,
+        aggregate_label: Optional[str] = None,
     ) -> str:
 
         sc = self.scorecard
@@ -1010,7 +1216,9 @@ class ScorecardVisualizer:
             include_pairs=include_pairs,
             sort_bins_by=sort_bins_by,
             selected_rule_ids=selected_rule_ids,
-            sample_row=sample_row
+            sample_row=sample_row,
+            aggregate_label=aggregate_label,
+            min_abs_points=min_abs_points
         )
 
         def _soft_break_tokens(s: str, every: int = 18) -> str:
@@ -1136,7 +1344,15 @@ class ScorecardVisualizer:
 
             wrapped_rows = [rows[0][:]]
             linecounts = [1]
+
+            agg_flags = []
             for cond, score in rows[1:]:
+                is_agg = (
+                    (aggregate_label is not None and cond.strip() == aggregate_label.strip())
+                    or cond.strip().startswith("Other")
+                )
+                agg_flags.append(is_agg)
+
                 lines = _wrap_by_pixels(cond, max_w_px, fs_base, renderer)
                 MAX_LINES = 3
                 if len(lines) > MAX_LINES:
@@ -1158,9 +1374,23 @@ class ScorecardVisualizer:
                 bbox=[0.01, y_cursor - table_h, 0.98, table_h],
             )
 
+            AGG_BG = "#b3b1b1"
+            score_col_idx = col_count - 1
+
             for r in range(len(wrapped_rows)):
                 units = row_units[r]
                 h = (units / total_units) * table_h
+
+                raw_label = rows[r][0] if r > 0 else ""
+                is_agg_row = (
+                    isinstance(raw_label, str)
+                    and (
+                        raw_label.strip() == (aggregate_label or "").strip()
+                        or raw_label.lower().startswith("other")
+                        or raw_label.lower().startswith("altre")
+                    )
+                )
+
                 for c in range(col_count):
                     cell = table[r, c]
                     cell.set_height(h)
@@ -1172,23 +1402,28 @@ class ScorecardVisualizer:
 
                     if r == 0:
                         cell.set_text_props(weight="bold")
-                        if c == col_count - 1:
-                            txt.set_ha("right")
-                    else:
-                        if c == 0:
-                            txt.set_ha("left")
-                        score_col_idx = col_count - 1
                         if c == score_col_idx:
                             txt.set_ha("right")
-                            txt.set_fontfamily("monospace")
-                            if norm is not None and cmap is not None:
-                                p = pts_per_row[r - 1]
-                                if p is not None:
-                                    rgba = cmap(norm(float(p)))
-                                    cell.set_facecolor(rgba)
-                                    txt.set_color(_fg_for_bg(rgba))
+                        continue
+
+                    if c == 0:
+                        txt.set_ha("left")
+                    if c == score_col_idx:
+                        txt.set_ha("right")
+                        txt.set_fontfamily("monospace")
+
+                    if is_agg_row and c == 0:
+                        cell.set_facecolor(AGG_BG)
+                        txt.set_color("black")
+                    elif c == score_col_idx and norm is not None and cmap is not None:
+                        p = pts_per_row[r - 1]
+                        if p is not None:
+                            rgba = cmap(norm(float(p)))
+                            cell.set_facecolor(rgba)
+                            txt.set_color(_fg_for_bg(rgba))
 
             y_cursor -= (table_h + row_gap)
+
 
 
         Cell.PAD = cell_pad

@@ -381,6 +381,30 @@ class AdditiveModel(ClassifierMixin, BaseEstimator):
             self.feature_names_in_ = np.arange(arr.shape[1])
             return arr, {j: j for j in range(arr.shape[1])}
 
+    def _find_binary_dummies(self, X: pd.DataFrame, eps: float = 1e-9) -> list[str]:
+        """
+        Identifica le colonne dummy binarie speculari (coppie 0/1 che sommano sempre a 1).
+        Restituisce la lista di colonne da droppare (una per coppia).
+        """
+        redundant = []
+        bin_cols = [c for c in X.columns if 
+                    np.all(X[c].dropna().isin([0,1]))]  # solo colonne 0/1
+        
+        visited = set()
+        for i, c1 in enumerate(bin_cols):
+            if c1 in visited:
+                continue
+            for c2 in bin_cols[i+1:]:
+                if c2 in visited:
+                    continue
+                # controlla se sono speculari: c1 + c2 == 1 (entro tolleranza)
+                s = (X[c1].values + X[c2].values)
+                if np.allclose(s, 1, atol=eps):
+                    # scegli una da droppare (es. la seconda)
+                    redundant.append(c2)
+                    visited.add(c2)
+        return redundant
+
     def fit(self, X: ArrayLike, y: ArrayLike, sample_weight: Optional[np.ndarray] = None):
         _prev_level = logger.level
         try:
@@ -395,6 +419,12 @@ class AdditiveModel(ClassifierMixin, BaseEstimator):
             if self.feature_importance_fn is not None:
                 out = self.feature_importance_fn(X, y)
                 self.feature_order = out[0] if isinstance(out, (tuple, list)) else out
+            
+            _to_drop = self._find_binary_dummies(X)
+            if _to_drop:
+                X = X.drop(columns=_to_drop)
+                if self.verbose >= 1:
+                    logger.info(f"Dummy binary removed (redundant): {_to_drop}")
 
             X_in, y_in = X, y
             X_arr, colmap = self._as_array(X_in)
