@@ -202,6 +202,18 @@ class ScorecardVisualizer:
         except Exception:
             return values
 
+    def _fmt_num(self, v: float) -> str:
+        v = float(v)
+        if np.isfinite(v) and abs(v - round(v)) < 1e-9:
+            return str(int(round(v)))
+        if v == 0.0:
+            return "0"
+        sig = max(1, int(self.sig_digits))
+        dec = max(0, sig - 1 - int(np.floor(np.log10(abs(v)))))
+        s = f"{v:.{dec}f}"
+        s = s.rstrip("0").rstrip(".")
+        return s
+
 
     def _inverse_thresholds(self, expr: str) -> str:
         if self.scaler is None:
@@ -307,9 +319,45 @@ class ScorecardVisualizer:
         return out_final
 
 
+    def _display_eps(self, *values: float) -> float:
+        vals = [abs(float(v)) for v in values if v is not None and np.isfinite(v)]
+        if not vals:
+            return 1e-9
+        def unit(v):
+            if v == 0: 
+                e = 0
+            else:
+                e = int(np.floor(np.log10(v)))
+            dec = max(0, int(self.sig_digits) - 1 - e)
+            return 10.0 ** (-dec)
+        return 0.5 * max(unit(v) for v in vals)
 
+    def _fmt_pair_distinguish(self, a: float, b: float) -> Tuple[str, str]:
+        sa, sb = self._fmt_num(a), self._fmt_num(b)
+        if sa != sb:
+            return sa, sb
+        vmax = max(abs(a), abs(b), 1e-12)
+        e = int(np.floor(np.log10(vmax))) if vmax > 0 else 0
+        dec0 = max(0, int(self.sig_digits) - 1 - e)
+        for dec in range(dec0 + 1, dec0 + 7):
+            sa = f"{a:.{dec}f}".rstrip("0").rstrip(".")
+            sb = f"{b:.{dec}f}".rstrip("0").rstrip(".")
+            if sa != sb:
+                return sa, sb
+        return sa, sb
+        
     def _format_interval_label(self, var: str, lo, lo_inc, hi, hi_inc) -> str:
         v = self._clean_identifier(var)
+        if lo is not None and hi is not None and np.isfinite(lo) and np.isfinite(hi):
+            eps = self._display_eps(lo, hi)
+            if abs(hi - lo) < eps:
+                mid = 0.5 * (float(lo) + float(hi))
+                return f"{v} = {self._fmt_num(mid)}"
+            slo, shi = self._fmt_pair_distinguish(float(lo), float(hi))
+            left = "≤" if lo_inc else "<"
+            right = "≤" if hi_inc else "<"
+            return f"{slo} {left} {v} {right} {shi}"
+
         if lo is None and hi is None:
             return v
         if lo is None:
@@ -318,25 +366,6 @@ class ScorecardVisualizer:
         if hi is None:
             br = "≥" if lo_inc else ">"
             return f"{v} {br} {self._fmt_num(lo)}"
-
-        left = "≤" if lo_inc else "<"
-        right = "≤" if hi_inc else "<"
-        return f"{self._fmt_num(lo)} {left} {v} {right} {self._fmt_num(hi)}"
-
-    def _fmt_num(self, v: float) -> str:
-        v = float(v)
-        if np.isfinite(v) and abs(v - round(v)) < 1e-9:
-            return str(int(round(v)))
-
-        if v == 0.0:
-            return "0"
-
-        sig = max(1, int(self.sig_digits))
-        dec = max(0, sig - 1 - int(np.floor(np.log10(abs(v)))))
-
-        s = f"{v:.{dec}f}"
-        s = s.rstrip("0").rstrip(".")
-        return s
 
 
     
@@ -661,7 +690,6 @@ class ScorecardVisualizer:
     def _merge_active_bins(bins):
         if not bins:
             return []
-
         norm_bins = []
         for lo, lo_inc, hi, hi_inc, pts in bins:
             lo_val = -float("inf") if lo is None else lo
@@ -673,17 +701,13 @@ class ScorecardVisualizer:
         merged = []
         for lo, lo_inc, hi, hi_inc, pts in norm_bins:
             if not merged:
-                merged.append([lo, lo_inc, hi, hi_inc, pts])
-                continue
+                merged.append([lo, lo_inc, hi, hi_inc, pts]); continue
             mlo, mlo_inc, mhi, mhi_inc, mpts = merged[-1]
             if lo < mhi or (lo == mhi and (lo_inc or mhi_inc)):
                 new_hi = max(mhi, hi)
-                if hi > mhi:
-                    new_hi_inc = hi_inc
-                elif hi == mhi:
-                    new_hi_inc = hi_inc or mhi_inc
-                else:
-                    new_hi_inc = mhi_inc
+                if hi > mhi: new_hi_inc = hi_inc
+                elif hi == mhi: new_hi_inc = hi_inc or mhi_inc
+                else: new_hi_inc = mhi_inc
                 merged[-1] = [mlo, mlo_inc, new_hi, new_hi_inc, mpts + pts]
             else:
                 merged.append([lo, lo_inc, hi, hi_inc, pts])
@@ -693,24 +717,49 @@ class ScorecardVisualizer:
             lo_val = None if lo == -float("inf") else lo
             hi_val = None if hi == float("inf") else hi
             out.append((lo_val, lo_inc, hi_val, hi_inc, pts))
-        return out
 
-    @staticmethod
+        # >>> DEDUP anche qui: comprimi intervalli puntuali entro la risoluzione di display
+        # (usa la stessa tolleranza del rendering)
+        def display_eps_pair(a, b):
+            vals = [x for x in (a, b) if x is not None and np.isfinite(x)]
+            if not vals: return 1e-9
+            # mezzo passo in base a sig_digits tipico attorno ad a/b
+            vmax = max(abs(float(x)) for x in vals)
+            e = int(np.floor(np.log10(vmax))) if vmax > 0 else 0
+            dec = max(0, 2 - 1 - e)  # se vuoi, sostituisci 2 con self.sig_digits passando self
+            return 0.5 * (10.0 ** (-dec))
+
+        cleaned = []
+        for lo, lo_inc, hi, hi_inc, pts in out:
+            if lo is not None and hi is not None and np.isfinite(lo) and np.isfinite(hi):
+                eps = display_eps_pair(lo, hi)
+                if abs(hi - lo) < eps:
+                    mid = 0.5 * (float(lo) + float(hi))
+                    cleaned.append((mid, True, mid, True, pts))
+                    continue
+            cleaned.append((lo, lo_inc, hi, hi_inc, pts))
+        return cleaned
+
+
+    
     def _partition_and_merge_intervals(
+        self,
         bins: List[Tuple[Optional[float], bool, Optional[float], bool, float]]
     ) -> List[Tuple[Optional[float], bool, Optional[float], bool, float]]:
-
         if not bins:
             return []
-
-        cuts = set()
-        for lo, _, hi, _, _ in bins:
-            if lo is not None and np.isfinite(lo):
-                cuts.add(lo)
-            if hi is not None and np.isfinite(hi):
-                cuts.add(hi)
-        cuts = sorted(cuts)
-
+        cuts = []
+        for lo,_,hi,_,_ in bins:
+            if lo is not None and np.isfinite(lo): cuts.append(float(lo))
+            if hi is not None and np.isfinite(hi): cuts.append(float(hi))
+        cuts.sort()
+        # dedup con tolleranza di display
+        eps = self._display_eps(*cuts) if cuts else 1e-9
+        dedup = []
+        for c in cuts:
+            if not dedup or abs(c - dedup[-1]) > eps:
+                dedup.append(c)
+        cuts = dedup
         bounds = [-float("inf")] + cuts + [float("inf")]
 
         out = []
