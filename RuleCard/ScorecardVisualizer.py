@@ -1352,14 +1352,11 @@ class ScorecardVisualizer:
             pts = [float(p) for p in pts if p is not None]
             if not pts:
                 return None, None
-            pmin, pmax = min(pts), max(pts)
-            if pmin < 0 < pmax:
-                vmax = max(abs(pmin), abs(pmax))
-                norm = colors.TwoSlopeNorm(vcenter=0.0, vmin=-vmax, vmax=vmax)
-            else:
-                norm = colors.Normalize(vmin=pmin, vmax=pmax)
+            vmax = max(abs(min(pts)), abs(max(pts)))
+            if vmax == 0:
+                vmax = 1.0
+            norm = colors.TwoSlopeNorm(vcenter=0.0, vmin=-vmax, vmax=vmax)
             return norm, colormaps.get_cmap(cmap_name)
-
 
         def _fg_for_bg(rgba):
             r, g, b, _ = rgba
