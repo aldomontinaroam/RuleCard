@@ -1253,6 +1253,10 @@ class ScorecardVisualizer:
         max_fig_height: Optional[float] = None,
         min_abs_points: Optional[float] = None,
         aggregate_label: Optional[str] = None,
+
+        fig_width: Optional[float] = None,
+        width_px: Optional[int] = None,
+        zero_is_green: bool = True,
     ) -> str:
 
         sc = self.scorecard
@@ -1328,7 +1332,26 @@ class ScorecardVisualizer:
                     lines.append(w)
             return lines
 
-        
+        def _text_width_px(s: str, fontsize: float, *, renderer) -> float:
+            t = Text(0, 0, s, fontsize=fontsize)
+            t.set_figure(fig)
+            bb = t.get_window_extent(renderer=renderer, dpi=fig.dpi)
+            return bb.width
+
+        def _wrap_pred_label(label_single: str, max_w_px: float, fontsize: float, *, renderer) -> str:
+            if _text_width_px(label_single, fontsize, renderer=renderer) <= max_w_px:
+                return label_single
+            parts = label_single.split("CLASS", 1)
+            if len(parts) == 2:
+                return parts[0].rstrip() + "\nCLASS" + parts[1]
+            return label_single
+
+        def _wrap_stats(score_txt: str, thr_txt: str, max_w_px: float, fontsize: float, *, renderer) -> str:
+            one_line = f"{score_txt} | {thr_txt}"
+            if _text_width_px(one_line, fontsize, renderer=renderer) <= max_w_px:
+                return one_line
+            return f"{score_txt}\n{thr_txt}"
+
 
         uni_linecounts  = [1] * max(0, len(uni_rows)  - 1)
         pair_linecounts = [1] * max(0, (len(pair_rows) - 1) if pair_rows else 0)
@@ -1342,12 +1365,32 @@ class ScorecardVisualizer:
 
         margin = 0.6 if title else 0.35
 
+        if width_px is not None:
+            width_in = float(width_px) / float(dpi)
+        elif fig_width is not None:
+            width_in = float(fig_width)
+        else:
+            width_in = 10.0
+
+        def _annotate_layout(axes_w_px: float):
+            compact = axes_w_px < 820
+            TOP_PAD = 0.02
+            BAR_H   = 0.12 if compact else 0.08  
+            GAP     = 0.02
+            fs_pred = 11 if compact else 13      
+            fs_stat = 9  if compact else 11      
+            bar_frac = 0.26 if compact else 0.18 
+            two_lines = compact                  
+            return dict(TOP_PAD=TOP_PAD, BAR_H=BAR_H, GAP=GAP,
+                        fs_pred=fs_pred, fs_stat=fs_stat,
+                        bar_frac=bar_frac, two_lines=two_lines)
+        
+        axes_w_px_est = width_in * dpi * 0.94
+        annot = _annotate_layout(axes_w_px_est)
+
         extra_top = 0.0
         if annotate_total:
-            TOP_PAD = 0.02
-            BAR_H   = 0.08
-            GAP     = 0.02
-            extra_top = TOP_PAD + BAR_H + GAP
+            extra_top = annot["TOP_PAD"] + annot["BAR_H"] + annot["GAP"]
 
         height_theoretical = max(
             min_row_inch * (1 + n_rows_grand_total),
@@ -1367,7 +1410,7 @@ class ScorecardVisualizer:
             base_row_h_eff = base_row_h
             height = height_theoretical
 
-        fig, ax = plt.subplots(figsize=(10, height), dpi=dpi)
+        fig, ax = plt.subplots(figsize=(width_in, height), dpi=dpi)
         ax.axis("off")
         if title:
             ax.set_title(title, fontsize=15, loc="center", pad=10)
@@ -1511,58 +1554,87 @@ class ScorecardVisualizer:
         
 
         if annotate_total and (total_points is not None):
+            if fig.canvas.get_renderer() is None:
+                fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+
+            ax_pos = ax.get_position()
+            axes_w_px = fig.get_size_inches()[0] * dpi * ax_pos.width
+
             pred_class = 1 if total_points >= points_threshold else 0
-            status_color = "#2ecc71" if pred_class == 1 else "#e74c3c"
+            GOOD_COLOR = "#2ecc71"
+            BAD_COLOR  = "#e74c3c"
 
-            proba = self._predict_proba_from_score(
-                [total_points], factor=sc.factor, offset=sc.offset
-            )[0]
-            p1 = float(proba[1])
-            pct_txt = f"{int(round(p1*100))}%"
+            good_class = 0 if zero_is_green else 1
+            status_color = GOOD_COLOR if pred_class == good_class else BAD_COLOR
 
+            proba = self._predict_proba_from_score([total_points], factor=sc.factor, offset=sc.offset)[0]
+            p1 = float(proba[1]); pct_txt = f"{int(round(p1*100))}%"
+
+            TOP_PAD, BAR_H, GAP = 0.02, 0.08, 0.02
             left, right = 0.02, 0.98
-            width = right - left
-            TOP_PAD, BAR_H = 0.02, 0.08
-            bottom = 1 - TOP_PAD - BAR_H
+            width_ax = right - left
+            bottom   = 1 - TOP_PAD - BAR_H
             center_y = bottom + BAR_H/2
 
             from matplotlib.patches import Rectangle, FancyBboxPatch
 
             ax.add_patch(FancyBboxPatch(
-                (left, bottom), width, BAR_H,
+                (left, bottom), width_ax, BAR_H,
                 boxstyle="round,pad=0.01",
                 facecolor=status_color, edgecolor=status_color,
-                alpha=0.15, transform=ax.transAxes, zorder=10, clip_on=False
+                alpha=0.15, transform=ax.transAxes, zorder=10
             ))
 
-            ax.text(left + 0.01*width, center_y,
-                    f"PREDICTION: CLASS {pred_class}",
-                    fontsize=13, weight='bold', color=status_color,
-                    va='center', ha='left', transform=ax.transAxes, zorder=11)
-
-            ax.text(left + 0.35*width, center_y,
-                    f"Score: {int(total_points)} | Threshold: {points_threshold}",
-                    fontsize=11, weight='bold', color='#2c3e50',
-                    va='center', ha='left', transform=ax.transAxes, zorder=11)
-
-            bar_w = 0.18*width
-            bar_x = left + 0.7*width
-            prog_h = 0.35*BAR_H
+            bar_w_frac = 0.20 * width_ax if axes_w_px >= 900 else 0.26 * width_ax
+            bar_x = left + width_ax - bar_w_frac
+            prog_h = 0.35 * BAR_H
             prog_y = center_y - prog_h/2
 
             ax.add_patch(Rectangle(
-                (bar_x, prog_y), bar_w, prog_h,
+                (bar_x, prog_y), bar_w_frac, prog_h,
                 facecolor='#ecf0f1', edgecolor='#95a5a6', linewidth=1,
                 transform=ax.transAxes, zorder=11
             ))
             ax.add_patch(Rectangle(
-                (bar_x, prog_y), bar_w * p1, prog_h,
+                (bar_x, prog_y), bar_w_frac * p1, prog_h,
                 facecolor=status_color, edgecolor='none',
                 transform=ax.transAxes, zorder=12
             ))
-            ax.text(bar_x + bar_w/2, center_y, pct_txt,
+            ax.text(bar_x + bar_w_frac/2, center_y, pct_txt,
                     fontsize=8, color='black', weight='bold',
                     va='center', ha='center', transform=ax.transAxes, zorder=13)
+
+            right_limit_x = bar_x - 0.02*width_ax
+
+            left_x = left + 0.01*width_ax
+            fs_pred = 13 if axes_w_px >= 900 else 11
+            pred_single = f"PREDICTION: CLASS {pred_class}"
+            max_left_px = (right_limit_x - left_x) * axes_w_px
+            pred_txt = _wrap_pred_label(pred_single, max_left_px, fs_pred, renderer=renderer)
+
+            pred_w_px = _text_width_px(pred_txt, fs_pred, renderer=renderer)
+            left_block_right_px = (left_x * axes_w_px) + pred_w_px
+
+            ax.text(left_x, center_y, pred_txt,
+                    fontsize=fs_pred, weight='bold', color=status_color,
+                    va='center', ha='left', transform=ax.transAxes, zorder=11)
+
+            fs_stat = 11 if axes_w_px >= 900 else 9
+            score_txt = f"Score: {int(total_points)}"
+            thr_txt   = f"Threshold: {points_threshold}"
+
+            max_center_px = (right_limit_x * axes_w_px) - left_block_right_px - 8
+            stats_txt = _wrap_stats(score_txt, thr_txt, max_center_px, fs_stat, renderer=renderer)
+
+            if "\n" not in stats_txt:
+                need = _text_width_px(stats_txt, fs_stat, renderer=renderer)
+                if need > max_center_px:
+                    stats_txt = f"{score_txt}\n{thr_txt}"
+
+            ax.text(right_limit_x, center_y, stats_txt,
+                    fontsize=fs_stat, color='#2c3e50', weight='bold',
+                    va='center', ha='right', transform=ax.transAxes, zorder=11)
                     
         if savepath is None:
             savepath = "scorecard_table.png"
