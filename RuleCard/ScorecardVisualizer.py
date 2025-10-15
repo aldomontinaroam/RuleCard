@@ -864,8 +864,34 @@ class ScorecardVisualizer:
             if isinstance(feats, (list, tuple)) and len(feats) == 1:
                 fname = str(feats[0])
                 fc = self._split_ohe(fname)
-                if fc:
-                    fam, cat = fc
+
+            if fc and (self.mapping and fc[0] in self.mapping):
+                fam, cat = fc
+                var = str(feats[0])
+                b = (bounds or {}).get(var, {})
+                lb, ub = b.get("lb"), b.get("ub")
+                eps = 1e-9
+
+                present = None
+                if (lb is None or np.isneginf(lb)) and (ub is not None and ub <= 0.5 + eps):
+                    present = False  # <= 0.5  -> NO
+                elif (ub is None or np.isposinf(ub)) and (lb is not None and lb >= 0.5 - eps):
+                    present = True   # >  0.5  -> YES
+
+                if present is not None:
+                    fam_label = self._clean_identifier(fam)
+                    cat_label = self._clean_identifier(cat)
+                    label = f"{fam_label} {cat_label} {'YES' if present else 'NO'}"
+                    plain_rows.append({"label": label, "points": pts, "stage_min": int(row["stage"])})
+                    continue
+
+                if fam not in aggregated:
+                    aggregated[fam] = {"points": 0.0, "cats": {}, "stage_min": int(row["stage"])}
+                aggregated[fam]["points"] += pts
+                aggregated[fam]["cats"][cat] = pts
+                aggregated[fam]["stage_min"] = min(aggregated[fam]["stage_min"], int(row["stage"]))
+                continue
+
 
             if fam and (self.mapping and fam in self.mapping):
 
