@@ -42,6 +42,10 @@ class ScorecardVisualizer:
         base = self._strip_prefix(str(name))
         return self._ohe_lookup.get(base)
 
+    def _pretty_operators(self, s: str) -> str:
+        return s.replace("<=", "≤").replace(">=", "≥")
+
+
     def _score_from_proba(self, p: float) -> float:
         sc = self.scorecard
         return float(sc.offset) + float(sc.factor) * np.log(float(p)/(1.0-float(p)))
@@ -469,7 +473,8 @@ class ScorecardVisualizer:
     @staticmethod
     def _clean_identifier(name: str) -> str:
         s = ScorecardVisualizer._strip_prefix(str(name))
-        s = re.sub(r"_+", " ", s).strip()
+        #s = re.sub(r"_+", " ", s).strip()
+        s = s.strip()
         return s
 
     def _clean_expr_for_display(self, expr: str) -> str:
@@ -547,16 +552,27 @@ class ScorecardVisualizer:
         present = self._is_true_token(tok)
         other = self._other_label(fam_label, cat, cats_obs)
 
+        #if op == "==":
+        #    if present:
+        #        return f"{fam_label} {cat}" if binary_like else f"{fam_label} = {cat}"
+        #    return (f"{fam_label} {other}" if (binary_like and other is not None)
+        #            else f"{fam_label} ≠ {cat}")
+        #else:
+        #    if present:
+        #        return (f"{fam_label} {other}" if (binary_like and other is not None)
+        #                else f"{fam_label} ≠ {cat}")
+        #    return f"{fam_label} {cat}" if binary_like else f"{fam_label} = {cat}"
         if op == "==":
             if present:
-                return f"{fam_label} {cat}" if binary_like else f"{fam_label} = {cat}"
-            return (f"{fam_label} {other}" if (binary_like and other is not None)
+                return f"{fam_label}_{cat}" if binary_like else f"{fam_label} = {cat}"
+            return (f"{fam_label}_{other}" if (binary_like and other is not None)
                     else f"{fam_label} ≠ {cat}")
         else:
             if present:
-                return (f"{fam_label} {other}" if (binary_like and other is not None)
+                return (f"{fam_label}_{other}" if (binary_like and other is not None)
                         else f"{fam_label} ≠ {cat}")
-            return f"{fam_label} {cat}" if binary_like else f"{fam_label} = {cat}"
+            return f"{fam_label}_{cat}" if binary_like else f"{fam_label} = {cat}"
+
 
     def _parse_numeric_interval(
         self, s: str
@@ -622,8 +638,12 @@ class ScorecardVisualizer:
         )
 
 
+        #def _render_yesno(fam: str, cat: str, present: bool) -> str:
+        #    return f"{self._clean_identifier(fam)} {self._clean_identifier(cat)} = {'YES' if present else 'NO'}"
         def _render_yesno(fam: str, cat: str, present: bool) -> str:
-            return f"{self._clean_identifier(fam)} {self._clean_identifier(cat)} {'YES' if present else 'NO'}"
+            fam_c = self._clean_identifier(fam)
+            cat_c = self._clean_identifier(cat)
+            return f"{fam_c}_{cat_c} = {'YES' if present else 'NO'}"
 
         def repl_exact(m):
             tok = m.group("tok")
@@ -881,7 +901,8 @@ class ScorecardVisualizer:
                 if present is not None:
                     fam_label = self._clean_identifier(fam)
                     cat_label = self._clean_identifier(cat)
-                    label = f"{fam_label} {cat_label} {'YES' if present else 'NO'}"
+                    #label = f"{fam_label} {cat_label} = {'YES' if present else 'NO'}"
+                    label = f"{fam_label}_{cat_label} = {'YES' if present else 'NO'}"
                     plain_rows.append({"label": label, "points": pts, "stage_min": int(row["stage"])})
                     continue
 
@@ -955,7 +976,9 @@ class ScorecardVisualizer:
 
                 cond_pretty = self._cond_pretty_all(cond_no_pref, vocab)
                 label = self._clean_expr_for_display(cond_pretty)
+                label = self._pretty_operators(label)
                 plain_rows.append({"label": label, "points": pts, "stage_min": int(row["stage"])})
+
 
 
         uni_rows = [["Bin", "Score"]]
@@ -974,7 +997,8 @@ class ScorecardVisualizer:
                 if active_cat is not None and active_cat in info["cats"]:
                     pts = float(info["cats"][active_cat])
                     cat_label = self._clean_identifier(active_cat)
-                    label = f"{fam_label} {cat_label}"
+                    #label = f"{fam_label} {cat_label}"
+                    label = f"{fam_label}_{cat_label}"
                     uni_items.append({
                         "label": label,
                         "points": pts,
@@ -984,13 +1008,15 @@ class ScorecardVisualizer:
                 for cat, pts in info["cats"].items():
                     cat_label = self._clean_identifier(cat)
                     uni_items.append({
-                        "label": f"{fam_label} {cat_label}",
+                        #"label": f"{fam_label} {cat_label}",
+                        "label": f"{fam_label}_{cat_label}",
                         "points": float(pts),
                         "stage_min": int(info["stage_min"])
                     })
                     if ADD_DUMMY_NO_ROW:
                         uni_items.append({
-                            "label": f"{fam_label} {cat_label} NO",
+                            #"label": f"{fam_label} {cat_label} = NO",
+                            "label": f"{fam_label}_{cat_label} = NO",
                             "points": 0.0,
                             "stage_min": int(info["stage_min"])
                         })
@@ -1072,6 +1098,7 @@ class ScorecardVisualizer:
                 cond_no_pref = self._strip_prefix(cond)
                 cond_pretty  = self._cond_pretty_all(cond_no_pref, vocab)
                 cond_display = self._clean_expr_for_display(cond_pretty)
+                cond_display = self._pretty_operators(cond_display) 
                 pair_rows.append([cond_display, f"{int(round(pts)):+d}"])
                 pair_pts.append(pts)
         
@@ -1084,6 +1111,7 @@ class ScorecardVisualizer:
                 cond_no_pref = self._strip_prefix(cond)
                 cond_pretty  = self._cond_pretty_all(cond_no_pref, vocab)
                 cond_display = self._clean_expr_for_display(cond_pretty)
+                cond_display = self._pretty_operators(cond_display) 
                 pair_items.append({
                     "label": cond_display,
                     "points": pts,
